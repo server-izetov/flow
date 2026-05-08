@@ -37,16 +37,33 @@ changes filtered via `git diff -w`), plan file, CLAUDE.md, rules files,
 the adversarial agent's probe path resolved by shelling out to
 `bin/test --adversarial-path` (the path lives inside the project's
 test tree so the language runner can discover it; halt on exit 2 from
-an unconfigured stub), and the `bin/flow ci --test --file` runner
-command. Run `tombstone-audit` to identify stale tombstones for
-removal in Step 4. No analysis.
+an unconfigured stub), the `bin/flow ci --test --file` runner command,
+and a narrowed list of doc paths likely affected by the diff (derived
+from `git diff --name-only` via filename heuristics — passed to the
+documentation agent in Step 2 so it investigates only those paths
+instead of the full docs tree). Run `tombstone-audit` to identify
+stale tombstones for removal in Step 4. No analysis.
 
 ### Step 2 — Launch
 
 Launch four agents in parallel. Reviewer is context-rich (receives full
-diff, plan, CLAUDE.md, rules). Pre-mortem, adversarial, and documentation
-are context-sparse (receive substantive diff only, investigate
-independently).
+diff, plan, CLAUDE.md, rules). Pre-mortem and adversarial are
+context-sparse (receive substantive diff only, investigate
+independently). Documentation is context-sparse + narrowed: receives
+substantive diff plus a filename-heuristic-derived list of doc paths
+likely affected by the diff (Step 1 derives the list from
+`git diff --name-only`), investigating only those paths so its turn
+budget stays bounded on moderately-sized PRs.
+
+After agents return, the skill checks each high-investigation agent
+(reviewer, learn-analyst, documentation) for the literal
+`END-OF-FINDINGS` completion marker. Marker absence means the agent
+was truncated by `maxTurns` exhaustion; the skill re-invokes that
+agent with a narrower partition (file family for documentation,
+tenant family for reviewer/learn-analyst) and combines findings
+across the multiple invocations. See
+`.claude/rules/cognitive-isolation.md` "Context Budget + Truncation
+Recovery".
 
 ### Step 3 — Triage
 

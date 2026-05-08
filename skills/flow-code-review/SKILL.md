@@ -183,6 +183,43 @@ prettier, black) reformat many files, the substantive diff excludes
 formatting noise and preserves the agents' turn budget for behavioral
 analysis.
 
+**Compute affected doc paths.**
+
+The documentation agent's turn budget is bounded; pointing it at the
+full `<worktree_path>/docs/` tree on moderately-sized PRs causes
+autocompact-thrash before findings are produced. The skill computes a
+narrowed list of doc paths likely affected by the diff via filename
+heuristics, and the agent investigates ONLY those paths.
+
+Capture the changed-file list:
+
+```bash
+git diff --name-only origin/<base_branch>...HEAD
+```
+
+From the changed-file list, derive `<doc_paths>` (a list of paths
+under `<worktree_path>` to embed inline in the documentation agent
+prompt):
+
+- For each `skills/<name>/SKILL.md` in the diff → add
+  `<worktree_path>/docs/skills/<name>.md`
+- For each phase skill (`skills/flow-<phase>/SKILL.md`) in the diff →
+  also add `<worktree_path>/docs/phases/phase-<N>-<phase>.md` (look up
+  `<N>` from `flow-phases.json` — phase order is the array index plus
+  one)
+- For each `.claude/rules/*.md` in the diff → include the rule path
+  itself so the agent can check cross-references in sibling rule files
+- Always include `<worktree_path>/CLAUDE.md`
+- If the diff touches `src/state.rs`, `src/phase_*.rs`, or
+  `flow-phases.json` → add
+  `<worktree_path>/docs/reference/flow-state-schema.md`
+- If the diff touches `agents/*.md` → add
+  `<worktree_path>/docs/reference/agents.md` if it exists
+
+Capture this list as `<doc_paths>` for use in Step 2. The narrowed
+list is exhaustive for documentation drift in this PR — the
+documentation agent does not need to walk the full docs tree.
+
 **Derive adversarial test setup.**
 
 The adversarial agent writes a single probe test file inside the
@@ -211,10 +248,27 @@ newline) or include trailing whitespace from line-continuation
 quoting. The contract is a single-line path; the skill normalizes
 defensively.
 
+<HARD-GATE>
 If `bin/test` exits 2, surface the stderr message and halt — the
 project must configure `bin/test --adversarial-path` (uncomment
 the runner block and set the matching path comment in `bin/test`)
 before Code Review can run. Do NOT proceed to Step 2.
+
+This is an infrastructure halt, not a decision point. There is a
+single option only — fix the unconfigured stub: uncomment the
+runner block in `bin/test` and set the matching path comment, then
+re-run Code Review. Do NOT enumerate alternatives ("(1) skip the
+adversarial agent, (2) abort the workflow, (3) configure
+`bin/test`") — every non-fix path silently weakens the quality
+gate.
+
+Per `.claude/rules/anti-patterns.md` "Never Offer to Skip Workflow
+Steps" and `.claude/rules/fix-infrastructure-bugs.md` "Fix
+Infrastructure Bugs Immediately": when an infrastructure halt
+fires inside a workflow, the response is to fix the underlying
+problem and resume — never to bypass the step that detected it.
+
+</HARD-GATE>
 
 The returned path may be absolute or relative. A relative path is
 resolved against the cwd you ran `bin/test --adversarial-path`
@@ -342,7 +396,8 @@ Provide the substantive diff output in the prompt, along with:
 - The path to the project CLAUDE.md
 - The branch name
 
-**Documentation agent** — context-sparse (receives substantive diff, doc paths):
+**Documentation agent** — context-sparse (receives substantive diff,
+narrowed doc-paths list, doc roots):
 
 Use the Agent tool with:
 
@@ -351,17 +406,58 @@ Use the Agent tool with:
 
 Provide the substantive diff output in the prompt, along with:
 
+- The narrowed list of doc paths (`<doc_paths>` from Step 1) — embed
+  inline, one path per line, under a `DOC_PATHS:` header
 - The path to the project CLAUDE.md
-- The path to the `.claude/rules/` directory
+- The path to the `.claude/rules/` directory (for cross-reference
+  checks only — the agent must investigate ONLY the listed doc paths
+  for documentation drift, not the full `<worktree_path>/docs/` tree)
 
 Prefix the prompt with:
 
 > "You are a new team member reading this PR for the first time. The
-> substantive diff (whitespace-only changes filtered) is below.
-> Investigate the codebase and documentation for comprehension barriers
-> and documentation drift."
+> substantive diff (whitespace-only changes filtered) is below, along
+> with a NARROWED LIST of doc paths likely affected by this PR (under
+> the DOC_PATHS header). Read each listed doc path and check it against
+> the diff for drift. Do NOT walk the full `<worktree>/docs/` tree —
+> the listed paths are exhaustive for documentation drift in this PR.
+> Investigate the codebase for comprehension barriers as usual."
 
 Wait for all agents to return.
+
+**Detect truncation and recover.**
+
+For each high-investigation agent (reviewer, learn-analyst,
+documentation), check whether the returned output contains the
+literal `END-OF-FINDINGS` completion marker as the final
+structural element. Marker absence means the agent was truncated
+by `maxTurns` exhaustion (see
+`.claude/rules/cognitive-isolation.md` "Context Budget +
+Truncation Recovery").
+
+When truncation is detected on an agent:
+
+1. Identify the partition strategy. For documentation (a
+   `DOC_PATHS:`-driven agent), partition the diff by file family
+   (`src/`, `tests/`, `agents/`, `skills/`, `.claude/`, `docs/`).
+   For reviewer, partition by tenant family (architecture +
+   simplicity vs. correctness + security). For learn-analyst,
+   partition by tenant (process gap, rule compliance, missing
+   rule).
+2. Re-invoke the truncated agent once per non-empty partition,
+   with the scope narrowed to that partition only. Keep the
+   agent's other inputs (plan, CLAUDE.md, rules, narrowed
+   doc-paths list) unchanged.
+3. Combine findings from every invocation as if they had come
+   from a single run. Each finding still maps to one of the
+   six tenants for triage in Step 3.
+
+If a re-invocation itself returns without the completion marker,
+that is double-truncation — the partition was still too large.
+Note the agent as truncated in the triage summary (Step 3)
+rather than splitting infinitely. The user decides whether to
+accept partial coverage or rerun Code Review on a smaller
+subset of the diff.
 
 The probe file lives inside the worktree's test tree, so worktree removal at Phase 6 Complete (or `/flow:flow-abort`) disposes of it automatically as a side effect of `git worktree remove`. The basename glob is also pre-listed in `.git/info/exclude` (`test_adversarial_flow.*`, `*_adversarial_flow_test.rb`) so the throwaway probe never appears in a user's `git status` output alongside intentional changes.
 
@@ -422,11 +518,22 @@ ${CLAUDE_PLUGIN_ROOT}/bin/flow add-finding --finding "<description>" --reason "<
 
 ### Truncation check
 
-Examine each agent's output for expected structure. Valid output contains
-`**Finding` blocks with category labels or explicit "No findings" markers.
-If an agent's output ends mid-sentence or is missing expected categories,
-the agent exhausted its turn budget. Note the incomplete agent in the
-triage table so the user knows coverage was partial.
+Step 2's recovery path re-invokes any agent that returned without the
+`END-OF-FINDINGS` completion marker (per
+`.claude/rules/cognitive-isolation.md` "Context Budget + Truncation
+Recovery"), so by Step 3 every high-investigation agent's output
+either ends with the marker (natural completion) or has been
+re-invoked across partitions until it does — with the combined
+findings already merged into a single set for that agent.
+
+The remaining truncation-detection responsibility in Step 3 is for
+the **double-truncation** case: an agent whose Step 2 re-invocation
+itself returned without the marker. Note that agent in the triage
+summary so the user knows coverage was partial. Pre-mortem and
+adversarial agents do not declare the marker (their investigation
+surface is naturally bounded by the diff itself); judge their
+completeness by whether they produced at least one structured
+`**Finding` block or an explicit "No findings" report.
 
 ### Triage summary
 
