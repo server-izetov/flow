@@ -310,19 +310,23 @@ if [ "$PER_FILE" = "1" ]; then
   # subcommand form only applies the regex to the printed table,
   # not to the fail-under calculation.
   if [ -f "$src_file" ]; then
-    echo "=== ${bin_name} (mirrored src: ${src_file}) ==="
     time_start=$SECONDS
-    # Step 1: run tests (cargo-llvm-cov captures profraw, no
-    # threshold gate yet — we extract the per-file number in
-    # step 2 below).
+    # Step 1: run tests. Capture cargo-llvm-cov output to a tempfile
+    # and surface it only on failure. The success path produces a
+    # single summary line so callers can sweep many files without
+    # drowning in repeated coverage tables.
+    nextest_log="$(mktemp)"
     set +e
     cargo llvm-cov "${COV_ARGS[@]}" nextest \
-      "${NEXTEST_ARGS[@]}" "$@"
+      "${NEXTEST_ARGS[@]}" "$@" >"$nextest_log" 2>&1
     rc=$?
     set -e
     if [ "$rc" -ne 0 ]; then
+      cat "$nextest_log" >&2
+      rm -f "$nextest_log"
       exit "$rc"
     fi
+    rm -f "$nextest_log"
     # Step 2: extract the coverage row for the mirrored src file
     # and assert all three percentages (Regions, Functions, Lines)
     # read 100.00%. We can't use cargo-llvm-cov's
@@ -343,47 +347,49 @@ if [ "$PER_FILE" = "1" ]; then
       # or equals "<basename>" exactly.
       $1 == f || $1 ~ "/" f "$" { print; exit }
     ')"
-    echo ""
-    echo "=== Coverage gate for ${src_file} ==="
+    elapsed=$((SECONDS - time_start))
     if [ -z "$cov_line" ]; then
       # cargo-llvm-cov omits files with zero instrumented regions
       # (e.g., a file that only contains derive macros or type
       # declarations — no executable code to cover). A file with
       # zero regions is trivially at 100% because there is nothing
       # to miss. Treat this as PASS.
-      echo "${src_file}: no instrumented regions (trivially 100/100/100)"
-    else
-      echo "$cov_line"
-      # Report layout: Regions cover in col 4, Functions cover
-      # (labeled "Executed") in col 7, Lines cover in col 10. All
-      # three must read 100.00%.
-      if ! printf '%s\n' "$cov_line" | awk '
-        { exit ($4 == "100.00%" && $7 == "100.00%" && $10 == "100.00%") ? 0 : 1 }
-      '; then
-        echo "" >&2
-        echo "FAIL: ${src_file} is not at 100/100/100" >&2
-        exit 1
-      fi
+      printf '%s  PASS  no-instrumented-regions  (%ss)\n' \
+        "$basename_src" "$elapsed"
+      exit 0
     fi
-    elapsed=$((SECONDS - time_start))
-    echo ""
-    echo "=== PASS (${elapsed}s) ==="
-    exit 0
+    # Report layout: Regions cover in col 4, Functions cover
+    # (labeled "Executed") in col 7, Lines cover in col 10.
+    regions_pct="$(printf '%s\n' "$cov_line" | awk '{print $4}')"
+    funcs_pct="$(printf '%s\n' "$cov_line" | awk '{print $7}')"
+    lines_pct="$(printf '%s\n' "$cov_line" | awk '{print $10}')"
+    if [ "$regions_pct" = "100.00%" ] && \
+       [ "$funcs_pct" = "100.00%" ] && \
+       [ "$lines_pct" = "100.00%" ]; then
+      printf '%s  PASS  %s / %s / %s  (%ss)\n' \
+        "$basename_src" "$regions_pct" "$funcs_pct" "$lines_pct" "$elapsed"
+      exit 0
+    fi
+    printf '%s  FAIL  %s / %s / %s  (%ss)\n' \
+      "$basename_src" "$regions_pct" "$funcs_pct" "$lines_pct" "$elapsed" >&2
+    exit 1
   fi
 
   # Meta-test (no mirrored src) — no coverage gate.
-  echo "=== ${bin_name} (meta-test, no mirrored src) ==="
   time_start=$SECONDS
+  nextest_log="$(mktemp)"
   set +e
-  cargo llvm-cov "${COV_ARGS[@]}" nextest "${NEXTEST_ARGS[@]}" "$@"
+  cargo llvm-cov "${COV_ARGS[@]}" nextest "${NEXTEST_ARGS[@]}" "$@" >"$nextest_log" 2>&1
   rc=$?
   set -e
   if [ "$rc" -ne 0 ]; then
+    cat "$nextest_log" >&2
+    rm -f "$nextest_log"
     exit "$rc"
   fi
+  rm -f "$nextest_log"
   elapsed=$((SECONDS - time_start))
-  echo ""
-  echo "=== PASS (${elapsed}s) ==="
+  printf '%s  PASS  meta-test  (%ss)\n' "$bin_name" "$elapsed"
   exit 0
 fi
 
