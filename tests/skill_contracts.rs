@@ -4359,6 +4359,169 @@ fn flow_skills_admin_and_maintainer_match_user_only() {
     }
 }
 
+// --- no-backwards-reasoning rule + skill scans ---
+
+/// The four canonical scan phrasings the SKILL bodies enumerate. Each phrase
+/// represents a distinct backward-facing reasoning shape; the rule must
+/// retain the body content that authorizes the scans.
+const SCAN_PHRASINGS: &[&str] = &[
+    "PR #<N> decided",
+    "kept for backward compatibility",
+    "older plugin versions",
+    "as PR #<N> chose to",
+];
+
+#[test]
+fn no_backwards_reasoning_rule_states_current_merits_principle() {
+    let path = common::repo_root()
+        .join(".claude")
+        .join("rules")
+        .join("no-backwards-reasoning.md");
+    let content = fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "expected `.claude/rules/no-backwards-reasoning.md` to exist: {}",
+            e
+        )
+    });
+
+    assert!(
+        content.contains("current merits"),
+        "rule must state the load-bearing `current merits` invariant phrase"
+    );
+    assert!(
+        content.contains("plugin version"),
+        "rule must explicitly cover the plugin-version-compat sub-case"
+    );
+
+    const FORBIDDEN_PATTERN_KEYWORDS: &[&str] = &[
+        "commit message",
+        "PR description",
+        "doc comment",
+        "git log",
+        "git blame",
+    ];
+    let hits: Vec<&&str> = FORBIDDEN_PATTERN_KEYWORDS
+        .iter()
+        .filter(|k| content.contains(**k))
+        .collect();
+    assert!(
+        hits.len() >= 3,
+        "rule must enumerate at least three forbidden-pattern keywords from {:?}; found {:?}",
+        FORBIDDEN_PATTERN_KEYWORDS,
+        hits
+    );
+
+    for phrase in SCAN_PHRASINGS {
+        assert!(
+            content.contains(phrase),
+            "rule must enumerate the SKILL scan phrasing `{}` so the rule remains the authoritative source for what the scans target",
+            phrase
+        );
+    }
+}
+
+#[test]
+fn flow_create_issue_skill_has_pre_draft_backwards_reasoning_scan() {
+    let content = common::read_skill("flow-create-issue");
+
+    let transform_idx = content
+        .find("## Transform + Draft")
+        .expect("flow-create-issue SKILL.md missing `## Transform + Draft`");
+    let scan_idx = content.find("Pre-Draft Backwards-Reasoning Scan").expect(
+        "flow-create-issue SKILL.md missing `Pre-Draft Backwards-Reasoning Scan` subsection",
+    );
+    let draft_idx = content
+        .find("### Draft Presentation")
+        .expect("flow-create-issue SKILL.md missing `### Draft Presentation`");
+
+    assert!(
+        content.contains(".claude/rules/no-backwards-reasoning.md"),
+        "Pre-Draft scan must cross-reference `.claude/rules/no-backwards-reasoning.md`"
+    );
+    assert!(
+        transform_idx < scan_idx,
+        "Pre-Draft scan must appear AFTER `## Transform + Draft`"
+    );
+    assert!(
+        scan_idx < draft_idx,
+        "Pre-Draft scan must appear BEFORE `### Draft Presentation`"
+    );
+
+    // Bound to the scan's body so a future drift cannot leave a stub heading
+    // and move the body elsewhere. The scan body sits between its `### `
+    // heading and the next `### ` (or the next `## `) heading.
+    let scan_tail = &content[scan_idx..];
+    let after_heading = scan_tail
+        .split_once('\n')
+        .map(|(_, t)| t)
+        .expect("scan heading must be followed by content");
+    let mut body_end = after_heading.len();
+    for marker in &["\n### ", "\n## "] {
+        if let Some((before, _)) = after_heading.split_once(marker) {
+            if before.len() < body_end {
+                body_end = before.len();
+            }
+        }
+    }
+    let scan_body = &after_heading[..body_end];
+    for phrase in SCAN_PHRASINGS {
+        assert!(
+            scan_body.contains(phrase),
+            "Pre-Draft scan body must enumerate the canonical scan phrasing `{}` (a stub heading without the body content does not satisfy the contract)",
+            phrase
+        );
+    }
+}
+
+#[test]
+fn flow_decompose_project_skill_has_backwards_reasoning_scan() {
+    let content = common::read_skill("flow-decompose-project");
+
+    assert!(
+        content.contains("Backwards-Reasoning Scan"),
+        "flow-decompose-project SKILL.md must include a `Backwards-Reasoning Scan` step"
+    );
+    assert!(
+        content.contains(".claude/rules/no-backwards-reasoning.md"),
+        "scan step must cross-reference `.claude/rules/no-backwards-reasoning.md`"
+    );
+
+    let scan_idx = content
+        .find("Backwards-Reasoning Scan")
+        .expect("scan heading checked above");
+    let present_idx = content
+        .find("Present the full issue list")
+        .expect("flow-decompose-project must contain `Present the full issue list` where children are surfaced");
+    assert!(
+        scan_idx < present_idx,
+        "Backwards-Reasoning Scan must appear BEFORE child issues are presented"
+    );
+
+    // Bound to the scan's body so a future drift cannot leave a stub heading
+    // and move the body content elsewhere.
+    let scan_tail = &content[scan_idx..];
+    let after_heading = scan_tail
+        .split_once('\n')
+        .map(|(_, t)| t)
+        .expect("scan heading must be followed by content");
+    let mut body_end = after_heading.len();
+    for marker in &["\n### ", "\n## "] {
+        if let Some((before, _)) = after_heading.split_once(marker) {
+            if before.len() < body_end {
+                body_end = before.len();
+            }
+        }
+    }
+    let scan_body = &after_heading[..body_end];
+    for phrase in SCAN_PHRASINGS {
+        assert!(
+            scan_body.contains(phrase),
+            "Backwards-Reasoning Scan body must enumerate the canonical scan phrasing `{}` (a stub heading without the body content does not satisfy the contract)",
+            phrase
+        );
+    }
+}
+
 // --- include-bias-in-issues rule content contract ---
 //
 // The contract test below pins four load-bearing invariants in
