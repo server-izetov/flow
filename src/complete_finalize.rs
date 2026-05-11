@@ -107,6 +107,25 @@ pub fn run_impl(args: &Args) -> Value {
         let _ = crate::lock::mutate_state(state_path, &mut |state| {
             let snap = crate::window_snapshot::capture_for_active_state(&home, state, &root);
             crate::window_snapshot::write_snapshot_into_state(state, "window_at_complete", &snap);
+            // Mirror the snapshot under the phase-scoped key so
+            // `format_complete_summary`'s `phase_delta` reads
+            // `phases.flow-complete.window_at_complete` for the
+            // Complete row. Hand-edited or corrupt state files may
+            // carry non-object values at any level, so per-level
+            // object guards heal the path before the IndexMut chain
+            // per `.claude/rules/rust-patterns.md` "State Mutation
+            // Object Guards" — unguarded IndexMut on a non-object
+            // primitive (number, string, bool, array) panics.
+            if state.is_object() {
+                if !state["phases"].is_object() {
+                    state["phases"] = serde_json::json!({});
+                }
+                if !state["phases"]["flow-complete"].is_object() {
+                    state["phases"]["flow-complete"] = serde_json::json!({});
+                }
+                state["phases"]["flow-complete"]["window_at_complete"] =
+                    serde_json::to_value(&snap).expect("WindowSnapshot must serialize");
+            }
         });
     }
 

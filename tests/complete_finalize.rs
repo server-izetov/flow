@@ -311,6 +311,221 @@ fn finalize_slash_branch_does_not_panic() {
     );
 }
 
+/// `complete_finalize` writes the account-window snapshot to BOTH
+/// the top-level `window_at_complete` field AND the phase-scoped
+/// `phases.flow-complete.window_at_complete` field. Without the dual
+/// write, `format_complete_summary`'s `phase_delta` short-circuits
+/// for flow-complete because it reads `phase.window_at_complete`,
+/// leaving the Complete row in the Token Cost section as a
+/// placeholder.
+///
+/// Uses an external state-file path so the per-branch cleanup pass
+/// at the end of `complete_finalize` does not wipe the file before
+/// the post-run assertions.
+#[test]
+fn complete_finalize_writes_phase_scoped_window_at_complete_for_flow_complete() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().canonicalize().unwrap();
+    let repo = make_repo_fixture(&parent);
+    let state_path = repo.join("external-state.json");
+    let state = common::make_complete_state(BRANCH, "complete", None);
+    fs::write(&state_path, serde_json::to_string_pretty(&state).unwrap()).unwrap();
+    let flow_bin = parent.join("bin-flow-stub").join("flow");
+    write_success_flow_stub(&flow_bin);
+    let stubs = path_stub_dir(&parent);
+
+    let (code, _, _) = run_complete_finalize(
+        &repo,
+        "42",
+        state_path.to_string_lossy().as_ref(),
+        BRANCH,
+        ".worktrees/test-feature",
+        false,
+        Some(&flow_bin),
+        Some(&stubs),
+    );
+
+    assert_eq!(code, 0);
+
+    let content = fs::read_to_string(&state_path).expect("state file must survive");
+    let state: Value = serde_json::from_str(&content).expect("state must parse");
+
+    let top_level = &state["window_at_complete"];
+    assert!(
+        top_level.is_object(),
+        "top-level window_at_complete must be populated; got: {}",
+        top_level
+    );
+
+    let phase_scoped = &state["phases"]["flow-complete"]["window_at_complete"];
+    assert!(
+        phase_scoped.is_object(),
+        "phases.flow-complete.window_at_complete must be populated alongside the top-level write; got: {}",
+        phase_scoped
+    );
+
+    // Both writes share the same snapshot — captured_at and
+    // session_id must match because they came from the same
+    // `capture_for_active_state` call inside the same mutate_state
+    // closure.
+    assert_eq!(
+        top_level["captured_at"], phase_scoped["captured_at"],
+        "top-level and phase-scoped writes must share captured_at; top: {} phase: {}",
+        top_level["captured_at"], phase_scoped["captured_at"]
+    );
+    assert_eq!(
+        top_level["session_id"], phase_scoped["session_id"],
+        "top-level and phase-scoped writes must share session_id; top: {} phase: {}",
+        top_level["session_id"], phase_scoped["session_id"]
+    );
+}
+
+/// Adversarial guard: when the on-disk state file has `phases`
+/// as a non-object value (hand-edited or corrupted), the new
+/// phase-scoped write must heal the path instead of panicking
+/// on the chained IndexMut. Reference: per-level object guards
+/// per `.claude/rules/rust-patterns.md` "State Mutation Object
+/// Guards".
+#[test]
+fn complete_finalize_heals_non_object_phases_without_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().canonicalize().unwrap();
+    let repo = make_repo_fixture(&parent);
+    let state_path = repo.join("external-state.json");
+    // `phases` is a JSON array — IndexMut on a string key would
+    // panic without the guard.
+    let state = json!({
+        "schema_version": 1,
+        "branch": BRANCH,
+        "repo": "test/test",
+        "pr_number": 42,
+        "phases": [],
+    });
+    fs::write(&state_path, state.to_string()).unwrap();
+    let flow_bin = parent.join("bin-flow-stub").join("flow");
+    write_success_flow_stub(&flow_bin);
+    let stubs = path_stub_dir(&parent);
+
+    let (code, _stdout, stderr) = run_complete_finalize(
+        &repo,
+        "42",
+        state_path.to_string_lossy().as_ref(),
+        BRANCH,
+        ".worktrees/test-feature",
+        false,
+        Some(&flow_bin),
+        Some(&stubs),
+    );
+
+    assert_eq!(code, 0);
+    assert!(
+        !stderr.contains("panicked at"),
+        "complete-finalize must not panic when phases is non-object; stderr={}",
+        stderr
+    );
+    // The healed phases object now carries the snapshot.
+    let content = fs::read_to_string(&state_path).expect("state must survive");
+    let state: Value = serde_json::from_str(&content).expect("state must parse");
+    assert!(
+        state["phases"]["flow-complete"]["window_at_complete"].is_object(),
+        "guard must heal phases and write the snapshot; got: {}",
+        state["phases"]
+    );
+}
+
+/// Adversarial guard: when `phases.flow-complete` is a non-object
+/// value (e.g. a hand-edited state file flattened the phase entry
+/// to a string), the new write must heal the inner level too. The
+/// outer `phases` is still a valid object here so the first guard
+/// is a no-op; the second guard does the healing.
+#[test]
+fn complete_finalize_heals_non_object_flow_complete_without_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().canonicalize().unwrap();
+    let repo = make_repo_fixture(&parent);
+    let state_path = repo.join("external-state.json");
+    let state = json!({
+        "schema_version": 1,
+        "branch": BRANCH,
+        "repo": "test/test",
+        "pr_number": 42,
+        "phases": {
+            "flow-start": {"status": "complete"},
+            "flow-code": {"status": "complete"},
+            "flow-review": {"status": "complete"},
+            "flow-learn": {"status": "complete"},
+            "flow-complete": "stringified-phase-state",
+        },
+    });
+    fs::write(&state_path, state.to_string()).unwrap();
+    let flow_bin = parent.join("bin-flow-stub").join("flow");
+    write_success_flow_stub(&flow_bin);
+    let stubs = path_stub_dir(&parent);
+
+    let (code, _stdout, stderr) = run_complete_finalize(
+        &repo,
+        "42",
+        state_path.to_string_lossy().as_ref(),
+        BRANCH,
+        ".worktrees/test-feature",
+        false,
+        Some(&flow_bin),
+        Some(&stubs),
+    );
+
+    assert_eq!(code, 0);
+    assert!(
+        !stderr.contains("panicked at"),
+        "complete-finalize must not panic when phases.flow-complete is non-object; stderr={}",
+        stderr
+    );
+    let content = fs::read_to_string(&state_path).expect("state must survive");
+    let state: Value = serde_json::from_str(&content).expect("state must parse");
+    assert!(
+        state["phases"]["flow-complete"]["window_at_complete"].is_object(),
+        "guard must heal flow-complete and write the snapshot; got: {}",
+        state["phases"]["flow-complete"]
+    );
+}
+
+/// Adversarial guard: when the entire state root is non-object
+/// (hand edit replaced the JSON object with an array or scalar),
+/// the outer `state.is_object()` guard must skip the write block
+/// entirely. The pre-existing `write_snapshot_into_state` helper
+/// already guards on `state.as_object_mut()` and silently no-ops,
+/// so the closure runs without side effects.
+#[test]
+fn complete_finalize_skips_non_object_state_without_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().canonicalize().unwrap();
+    let repo = make_repo_fixture(&parent);
+    let state_path = repo.join("external-state.json");
+    // State root is a JSON array — both write_snapshot_into_state
+    // and the new chained IndexMut must skip without panic.
+    fs::write(&state_path, "[1,2,3]").unwrap();
+    let flow_bin = parent.join("bin-flow-stub").join("flow");
+    write_success_flow_stub(&flow_bin);
+    let stubs = path_stub_dir(&parent);
+
+    let (code, _stdout, stderr) = run_complete_finalize(
+        &repo,
+        "42",
+        state_path.to_string_lossy().as_ref(),
+        BRANCH,
+        ".worktrees/test-feature",
+        false,
+        Some(&flow_bin),
+        Some(&stubs),
+    );
+
+    assert_eq!(code, 0);
+    assert!(
+        !stderr.contains("panicked at"),
+        "complete-finalize must not panic when state root is non-object; stderr={}",
+        stderr
+    );
+}
+
 #[test]
 fn finalize_pull_flag_threads_to_cleanup() {
     let dir = tempfile::tempdir().unwrap();
