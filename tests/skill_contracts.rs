@@ -4719,48 +4719,42 @@ fn flow_decompose_project_announce_sets_utility_marker() {
 }
 
 #[test]
-fn flow_decompose_project_step1_cancel_clears_utility_marker() {
-    // After Step 1's Cancel branch fires, the skill must clear the
-    // per-session utility-in-progress marker. Without the clear,
-    // every subsequent turn-end in the session is blocked because
-    // the Stop hook still sees an active marker for a skill that
-    // has already cancelled — leaving the session deadlocked.
+fn flow_decompose_project_step_1_no_dag_review_ask_user_question() {
+    // Regression: a future edit re-introduces the Step 1 DAG-review
+    // AskUserQuestion gate. Per AC#4 of issue #1488, the user's
+    // invocation of `/flow:flow-decompose-project` is the single
+    // authorization for the decompose-and-file pipeline; a second
+    // confirmation between Step 1 (decompose) and Step 2 (issue list)
+    // broke the single-signal contract. The forbidden phrasing is
+    // the exact AskUserQuestion option label the removed gate used.
     let c = common::read_skill("flow-decompose-project");
-    let step1_tail = c
-        .split_once("\n## Step 1")
-        .map(|(_, t)| t)
-        .expect("flow-decompose-project must have a `## Step 1` section");
-    let step1 = step1_tail
-        .split_once("\n## ")
-        .map(|(s, _)| s)
-        .unwrap_or(step1_tail);
-    let cancel_tail = step1
-        .split_once("**\"Cancel\"**")
-        .map(|(_, t)| t)
-        .expect("Step 1 must include a `**\"Cancel\"**` branch");
-    let window: String = cancel_tail.lines().take(60).collect::<Vec<_>>().join("\n");
     assert!(
-        window.contains("clear-utility-in-progress"),
-        "Step 1 Cancel branch must invoke `bin/flow clear-utility-in-progress` so the Stop hook stops refusing turn-end after cancellation"
-    );
-    assert!(
-        window.contains("--skill flow:flow-decompose-project"),
-        "Step 1 Cancel branch's clear call must scope the marker to `flow:flow-decompose-project`"
+        !c.contains("Proceed to review"),
+        "skills/flow-decompose-project/SKILL.md must not contain the Step 1 `Proceed to review` AskUserQuestion option — Step 2 fires directly after the DAG synthesis is presented"
     );
 }
 
 #[test]
-fn flow_decompose_project_step2_cancel_clears_utility_marker() {
-    // After Step 2's Cancel branch fires, the skill must clear the
-    // per-session utility-in-progress marker. Same deadlock failure
-    // mode as Step 1: a missed clear leaves the Stop hook refusing
-    // turn-end for the rest of the session.
-    //
-    // The end delimiter is `\n## Step ` (not a bare `\n## `) so an
-    // intra-section heading rendered inside a fenced markdown
-    // example block — like `## Implementation Plan` inside the
-    // Body Shape Contract example — cannot truncate the slice
-    // before the HARD-GATE's Cancel branch.
+fn flow_decompose_project_step_2_no_due_date_prompt() {
+    // Regression: a future edit re-introduces the Step 2 milestone
+    // due-date AskUserQuestion. The milestone path is removed
+    // entirely; the skill no longer creates milestones in Step 3
+    // and `bin/flow create-milestone` is deleted. A re-introduced
+    // due-date prompt would have no consumer for the captured
+    // value.
+    let c = common::read_skill("flow-decompose-project");
+    assert!(
+        !c.contains("milestone due date"),
+        "skills/flow-decompose-project/SKILL.md must not prompt for milestone due date — the milestone path is removed"
+    );
+}
+
+#[test]
+fn flow_decompose_project_step_2_no_milestone_mention() {
+    // Regression: a future edit re-introduces a milestone bullet,
+    // `--milestone` flag pass-through, or `due_date` session field
+    // in Step 2. With `bin/flow create-milestone` deleted, every
+    // milestone reference in the skill is orphan infrastructure.
     let c = common::read_skill("flow-decompose-project");
     let step2_tail = c
         .split_once("\n## Step 2")
@@ -4770,18 +4764,121 @@ fn flow_decompose_project_step2_cancel_clears_utility_marker() {
         .split_once("\n## Step ")
         .map(|(s, _)| s)
         .unwrap_or(step2_tail);
-    let cancel_tail = step2
-        .split_once("**\"Cancel\"**")
-        .map(|(_, t)| t)
-        .expect("Step 2 must include a `**\"Cancel\"**` branch");
-    let window: String = cancel_tail.lines().take(60).collect::<Vec<_>>().join("\n");
     assert!(
-        window.contains("clear-utility-in-progress"),
-        "Step 2 Cancel branch must invoke `bin/flow clear-utility-in-progress` so the Stop hook stops refusing turn-end after cancellation"
+        !step2.to_ascii_lowercase().contains("milestone"),
+        "skills/flow-decompose-project/SKILL.md Step 2 must not mention milestones — the milestone path is removed"
     );
     assert!(
-        window.contains("--skill flow:flow-decompose-project"),
-        "Step 2 Cancel branch's clear call must scope the marker to `flow:flow-decompose-project`"
+        !step2.contains("due_date") && !step2.contains("due-date"),
+        "skills/flow-decompose-project/SKILL.md Step 2 must not carry a `due_date` session field — the milestone path is removed"
+    );
+}
+
+#[test]
+fn flow_decompose_project_step_3_no_create_milestone_call() {
+    // Regression: a future edit re-introduces the
+    // `bin/flow create-milestone` invocation in Step 3. The
+    // subcommand is deleted from `src/create_milestone.rs`,
+    // `src/lib.rs`, and `src/main.rs`; resurrecting the SKILL.md
+    // call would surface as a runtime error rather than a
+    // compile error.
+    let c = common::read_skill("flow-decompose-project");
+    assert!(
+        !c.contains("create-milestone"),
+        "skills/flow-decompose-project/SKILL.md must not invoke `bin/flow create-milestone` — the subcommand is deleted"
+    );
+}
+
+#[test]
+fn flow_decompose_project_step_3_validator_auto_fix_loop() {
+    // Regression: a future edit drops the bounded auto-fix loop on
+    // Step 3 epic-validator failure and replaces it with either an
+    // unbounded loop or a prompt-the-user gate. The
+    // `validator_max_retries` reason is the contract the
+    // COMPLETE-FAILED banner depends on.
+    let c = common::read_skill("flow-decompose-project");
+    let step3_tail = c
+        .split_once("\n## Step 3")
+        .map(|(_, t)| t)
+        .expect("flow-decompose-project must have a `## Step 3` section");
+    let step3 = step3_tail
+        .split_once("\n## Step ")
+        .map(|(s, _)| s)
+        .unwrap_or(step3_tail);
+    assert!(
+        step3.contains("validator_max_retries"),
+        "Step 3 must name `validator_max_retries` so the structured-error contract is locked in"
+    );
+    assert!(
+        step3.contains("5 attempts") || step3.contains("5 retries"),
+        "Step 3 must name the 5-attempt cap so the bounded-loop contract is locked in"
+    );
+}
+
+#[test]
+fn flow_decompose_project_step_4_validator_auto_fix_loop() {
+    // Regression: a future edit drops the Step 4 per-child auto-fix
+    // loop and replaces it with either an unbounded loop or a
+    // prompt-the-user gate. Step 4's failure mode is skip-on-cap
+    // (continue to next child) rather than halt-on-cap (Step 3's
+    // epic-failure path), so the prose must signal the skip
+    // semantics.
+    let c = common::read_skill("flow-decompose-project");
+    let step4_tail = c
+        .split_once("\n## Step 4")
+        .map(|(_, t)| t)
+        .expect("flow-decompose-project must have a `## Step 4` section");
+    let step4 = step4_tail
+        .split_once("\n## Step ")
+        .map(|(s, _)| s)
+        .unwrap_or(step4_tail);
+    assert!(
+        step4.contains("5 attempts") || step4.contains("5 retries"),
+        "Step 4 must name the 5-attempt cap so the bounded-loop contract is locked in"
+    );
+    assert!(
+        step4.to_ascii_lowercase().contains("skip"),
+        "Step 4 must name the skip-on-cap semantics so the child-failure recovery contract is locked in"
+    );
+}
+
+#[test]
+fn flow_decompose_project_step_3_no_milestone_flag_in_issue_call() {
+    // Regression: a future edit re-introduces `--milestone` on the
+    // Step 3 epic-filing `bin/flow issue` call. The flag is deleted
+    // from `src/issue.rs`; resurrecting the SKILL.md pass-through
+    // would surface as a runtime error.
+    let c = common::read_skill("flow-decompose-project");
+    let step3_tail = c
+        .split_once("\n## Step 3")
+        .map(|(_, t)| t)
+        .expect("flow-decompose-project must have a `## Step 3` section");
+    let step3 = step3_tail
+        .split_once("\n## Step ")
+        .map(|(s, _)| s)
+        .unwrap_or(step3_tail);
+    assert!(
+        !step3.contains("--milestone"),
+        "skills/flow-decompose-project/SKILL.md Step 3 must not pass `--milestone` to `bin/flow issue` — the flag is deleted"
+    );
+}
+
+#[test]
+fn flow_decompose_project_step_4_no_milestone_flag_in_issue_call() {
+    // Same regression guard as Step 3 but scoped to the per-child
+    // filing loop in Step 4.
+    let c = common::read_skill("flow-decompose-project");
+    let step4_tail = c
+        .split_once("\n## Step 4")
+        .map(|(_, t)| t)
+        .expect("flow-decompose-project must have a `## Step 4` section");
+    let step4 = step4_tail
+        .split_once("\n## Step ")
+        .map(|(s, _)| s)
+        .unwrap_or(step4_tail);
+    assert!(
+        !step4.contains("--milestone"),
+        "skills/flow-decompose-project/SKILL.md Step 4 must not pass `--milestone` to `bin/flow issue` — the flag is deleted"
     );
 }
 
@@ -5309,6 +5406,59 @@ fn flow_plan_skill_uses_utility_in_progress_marker() {
     );
 }
 
+#[test]
+fn flow_plan_has_no_wrap_up_ask_user_question() {
+    // Regression: a future edit re-introduces a wrap-up
+    // AskUserQuestion gate into the Step 6 filing path. Per
+    // AC#4 of issue #1488, the user's readiness signal from
+    // Step 4 (Discussion Mode) is the single authorization to
+    // file. The decompose pass + transform that precede Step 6
+    // are unattended infrastructure; a second confirmation
+    // question between the signal and the success banner breaks
+    // the single-signal contract. The specific phrasing the
+    // obsolete gate used was "Review the draft above. Ready to
+    // file?"; catching that exact prompt locks in the
+    // discipline against accidental resurrection.
+    let c = common::read_skill("flow-plan");
+    assert!(
+        !c.contains("Review the draft above. Ready to file?"),
+        "skills/flow-plan/SKILL.md must not contain the wrap-up AskUserQuestion prompt — Step 6 files directly after the decompose + transform pipeline"
+    );
+}
+
+#[test]
+fn flow_plan_validator_auto_fix_loop() {
+    // Regression: a future edit drops the bounded auto-fix loop
+    // on validator failure and replaces it with either an
+    // unbounded loop (would silently file a malformed body if
+    // the validator passes after many retries) or a prompt-the-
+    // user gate (breaks the single-signal contract). The
+    // `validator_max_retries` reason is the contract the
+    // COMPLETE-FAILED banner depends on.
+    let c = common::read_skill("flow-plan");
+    assert!(
+        c.contains("validator_max_retries"),
+        "skills/flow-plan/SKILL.md must name the `validator_max_retries` error reason so the structured-error contract is locked in"
+    );
+}
+
+#[test]
+fn flow_plan_validator_retry_cap_is_five() {
+    // Regression: a future edit raises or lowers the retry cap.
+    // Five attempts is the documented bound chosen so the
+    // skill can iterate through every reasonable mechanical fix
+    // class (sentinel placement, missing subsection, heading
+    // level) but cannot loop indefinitely on a body the
+    // validator will never accept. Lowering the cap would
+    // prematurely fail on legitimate fix sequences; raising it
+    // would mask validator bugs as productive retries.
+    let c = common::read_skill("flow-plan");
+    assert!(
+        c.contains("5 attempts") || c.contains("5 retries"),
+        "skills/flow-plan/SKILL.md must name the 5-attempt cap so the bounded-loop contract is locked in"
+    );
+}
+
 // --- flow-plan rewrite contract tests ---
 //
 // `/flow:flow-plan #N` consumes a vanilla problem-statement issue
@@ -5572,29 +5722,62 @@ fn flow_explore_skill_files_without_decomposed_label() {
 }
 
 #[test]
-fn flow_explore_skill_uses_utility_in_progress_marker() {
-    // Regression: a future edit drops either the set or the clear
-    // side of the per-session utility-in-progress marker. Without
-    // `set-utility-in-progress`, the Stop hook returns control to
-    // the user mid-conversation when a planning sub-agent Skill
-    // tool returns — breaking the unattended-discussion contract.
-    // Without `clear-utility-in-progress`, the session deadlocks
-    // after the skill completes.
-    //
-    // Consumer: the Stop hook's `check_in_progress_utility_skill`
-    // predicate, which refuses turn-end while a per-session marker
-    // is present for `flow:flow-explore`.
+fn flow_explore_has_no_utility_marker_calls() {
+    // Regression: a future edit re-introduces marker calls into
+    // `skills/flow-explore/SKILL.md`. The skill is excluded from
+    // `crate::commands::utility_marker::MULTI_STEP_UTILITY_SKILLS`
+    // because it never invokes `decompose:decompose` — the Stop
+    // hook's decompose-return gate cannot fire on its behalf.
+    // Adding marker calls back would create dead code: the marker
+    // would be written but the predicate would always drop it via
+    // the allowlist check, leaving the user mystified about why
+    // discussion replies still ended the turn cleanly. The
+    // regression ships silent unless this scan catches it.
     let c = common::read_skill("flow-explore");
     assert!(
-        c.contains("set-utility-in-progress"),
-        "skills/flow-explore/SKILL.md must invoke `bin/flow set-utility-in-progress` so the Stop hook refuses turn-end during discussion"
+        !c.contains("set-utility-in-progress"),
+        "skills/flow-explore/SKILL.md must not invoke `bin/flow set-utility-in-progress` — flow-explore is excluded from MULTI_STEP_UTILITY_SKILLS and the Stop hook ignores its marker"
     );
     assert!(
-        c.contains("clear-utility-in-progress"),
-        "skills/flow-explore/SKILL.md must invoke `bin/flow clear-utility-in-progress` so the Stop hook releases turn-end after every exit boundary"
+        !c.contains("clear-utility-in-progress"),
+        "skills/flow-explore/SKILL.md must not invoke `bin/flow clear-utility-in-progress` — there is no marker to clear"
+    );
+}
+
+#[test]
+fn flow_explore_has_no_wrap_up_ask_user_question() {
+    // Regression: a future edit re-introduces a wrap-up
+    // AskUserQuestion gate into the Step 5 filing path. Per the
+    // discussion-mode contract, the user's readiness signal
+    // ("ready", "file it", "let's go") is the single authorization
+    // to file — a second confirmation prompt breaks AC#4
+    // (single-signal filing). The specific phrasing the obsolete
+    // gate used was "Review the draft above. Ready to file?";
+    // catching that exact prompt locks in the discipline against
+    // accidental resurrection.
+    let c = common::read_skill("flow-explore");
+    assert!(
+        !c.contains("Review the draft above. Ready to file?"),
+        "skills/flow-explore/SKILL.md must not contain the wrap-up AskUserQuestion prompt — Step 5 files directly on the user's readiness signal"
+    );
+}
+
+#[test]
+fn flow_explore_validator_auto_fix_loop() {
+    // Regression: a future edit drops the bounded auto-fix loop and
+    // replaces it with either an unbounded loop (would silently
+    // file a malformed body if the validator passes after many
+    // retries) or a prompt-the-user gate (breaks the single-signal
+    // contract). The 5-attempt cap is the documented bound and the
+    // `validator_max_retries` reason is the contract the COMPLETE-
+    // FAILED banner depends on.
+    let c = common::read_skill("flow-explore");
+    assert!(
+        c.contains("validator_max_retries"),
+        "skills/flow-explore/SKILL.md must name the `validator_max_retries` error reason so the structured-error contract is locked in"
     );
     assert!(
-        c.contains("--skill flow:flow-explore"),
-        "skills/flow-explore/SKILL.md must pass `--skill flow:flow-explore` so the marker is scoped to this skill's identifier"
+        c.contains("5 attempts") || c.contains("5 retries"),
+        "skills/flow-explore/SKILL.md must name the 5-attempt cap so the bounded-loop contract is locked in"
     );
 }

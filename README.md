@@ -60,13 +60,15 @@ Once `/flow-start` lands, you're inside the lifecycle. Each phase is its own ski
 1: Start  →  2: Code  →  3: Review  →  4: Learn  →  5: Complete
 ```
 
-| Phase | What happens |
-|-------|-------------|
-| **1: Start** | Acquire start lock, run `bin/flow ci` baseline on the integration branch, upgrade dependencies, commit, unlock, then create worktree + PR. `ci-fixer` sub-agent repairs any dependency breakage once; subsequent flows inherit the fix via the CI sentinel. Plan is extracted from the issue body's `<!-- FLOW-PLAN-BEGIN -->`/`<!-- FLOW-PLAN-END -->` sentinels. |
-| **2: Code** | Test-first per task, diff review before `bin/flow ci`, commit per task, 100% coverage enforced. |
-| **3: Review** | Four cognitively isolated agents in parallel — `reviewer`, `pre-mortem`, `adversarial`, `documentation`. Parent triages findings and fixes in-scope issues. |
-| **4: Learn** | Learnings routed to project `CLAUDE.md` and `.claude/rules/`; plugin process gaps filed as GitHub issues. |
-| **5: Complete** | Merge the PR, remove the worktree, delete the state file. |
+| Phase | Command | What happens |
+|-------|---------|-------------|
+| **1: Start** | `/flow-start` | Acquire start lock, run `bin/flow ci` baseline on the integration branch, upgrade dependencies, commit, unlock, then create worktree + PR. `ci-fixer` sub-agent repairs any dependency breakage once; subsequent flows inherit the fix via the CI sentinel. Plan is extracted from the issue body's `<!-- FLOW-PLAN-BEGIN -->`/`<!-- FLOW-PLAN-END -->` sentinels. |
+| **2: Code** | `/flow-code` | Test-first per task, diff review before `bin/flow ci`, commit per task, 100% coverage enforced. |
+| **3: Review** | `/flow-review` | Four cognitively isolated agents in parallel — `reviewer`, `pre-mortem`, `adversarial`, `documentation`. Parent triages findings and fixes in-scope issues. |
+| **4: Learn** | `/flow-learn` | Learnings routed to project `CLAUDE.md` and `.claude/rules/`; plugin process gaps filed as GitHub issues. |
+| **5: Complete** | `/flow-complete` | Merge the PR, close issues referenced in the prompt, remove the worktree, delete the state file. |
+
+Maintainer-only commands (private to this repo): `/flow-release` ships a tagged version; `/flow-changelog-audit` reviews Claude Code's CHANGELOG for plugin-relevant changes.
 
 ---
 
@@ -159,7 +161,7 @@ Every planning skill is role-bound: PM, Tech Lead, or CTO voices with their own 
 
 ### Whole-project decomposition
 
-- **`/flow-decompose-project <description>`** — Decompose a large project into a fully linked GitHub issue graph: epic, milestones, sub-issues, blocked-by dependencies, and phase labels. Every issue is filed work-ready with acceptance criteria, file paths, and scope boundaries from real codebase exploration. Feeds directly into `/flow-orchestrate`.
+- **`/flow-decompose-project <description>`** — Decompose a large project into a fully linked GitHub issue graph: epic, sub-issues, blocked-by dependencies, and phase labels. Every issue is filed work-ready with acceptance criteria, file paths, and scope boundaries from real codebase exploration. Feeds directly into `/flow-orchestrate`.
 
 ### Working an existing backlog
 
@@ -189,6 +191,8 @@ Run `/flow-skills` anytime to see the live catalog grouped by role.
 | Skill | Purpose |
 |-------|---------|
 | `/flow-start` | Begin a new feature — worktree, PR, state file, plan extraction from issue body sentinels |
+| `/flow-commit` | Show diff, write commit message, run CI gate, commit and push — used by every commit-producing skill |
+| `/flow-note` | Capture a correction or learning to the active flow's state file mid-session |
 | `/flow-config` | Display the per-skill autonomy configuration from `.flow.json` |
 | `/flow-skills` | Display this catalog grouped by role |
 

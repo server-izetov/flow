@@ -1804,6 +1804,232 @@ fn test_skills_no_flow_create_issue_references() {
     );
 }
 
+/// Tombstone: removed in PR #1489. `skills/flow-explore/SKILL.md`
+/// no longer invokes `set-utility-in-progress` or
+/// `clear-utility-in-progress`. The skill is excluded from
+/// `crate::commands::utility_marker::MULTI_STEP_UTILITY_SKILLS`
+/// because it never invokes `decompose:decompose`, so the Stop
+/// hook's decompose-return gate cannot fire on its behalf. Both
+/// marker strings are stable source literals — they appear as
+/// exact CLI subcommand names in skill bash blocks, are never
+/// constructed via `concat!`, `format!`, or constant references in
+/// the SKILL.md corpus, and are never split across `.arg()` chains.
+#[test]
+fn test_flow_explore_no_utility_marker_calls() {
+    let content = common::read_skill("flow-explore");
+    assert!(
+        !content.contains("set-utility-in-progress"),
+        "skills/flow-explore/SKILL.md must not contain `set-utility-in-progress` (removed in PR #1489: marker writes are dead code when MULTI_STEP_UTILITY_SKILLS excludes flow-explore)"
+    );
+    assert!(
+        !content.contains("clear-utility-in-progress"),
+        "skills/flow-explore/SKILL.md must not contain `clear-utility-in-progress` (removed in PR #1489: nothing to clear when no marker is written)"
+    );
+}
+
+/// Tombstone: removed in PR #1489. `skills/flow-explore/SKILL.md`
+/// no longer carries a wrap-up AskUserQuestion gate before filing.
+/// The user's readiness signal in Step 3 is the single
+/// authorization to file; a second confirmation question breaks
+/// AC#4 (single-signal filing). The forbidden phrasing is the
+/// exact verbatim prompt the removed gate used; this is a stable
+/// source literal (a full English sentence appearing in the SKILL
+/// prose), not assembled via `concat!`, `format!`, or constant
+/// composition.
+#[test]
+fn test_flow_explore_no_wrap_up_ask_user_question() {
+    let content = common::read_skill("flow-explore");
+    let forbidden = "Review the draft above. Ready to file?";
+    assert!(
+        !content.contains(forbidden),
+        "skills/flow-explore/SKILL.md must not contain the wrap-up AskUserQuestion prompt `{}` (removed in PR #1489: Step 5 files directly on the user's readiness signal)",
+        forbidden,
+    );
+}
+
+/// Tombstone: removed in PR #1489. `skills/flow-plan/SKILL.md` no
+/// longer carries a wrap-up AskUserQuestion gate before filing the
+/// decomposed issue. Per AC#4 of issue #1488, the user's readiness
+/// signal from the Step 4 discussion is the single authorization
+/// to file; the decompose + transform pipeline that precedes Step 6
+/// is unattended infrastructure, not a second decision point. The
+/// forbidden phrasing is the exact verbatim prompt the removed
+/// gate used; this is a stable source literal (a full English
+/// sentence appearing in the SKILL prose), not assembled via
+/// `concat!`, `format!`, or constant composition.
+#[test]
+fn test_flow_plan_no_wrap_up_ask_user_question() {
+    let content = common::read_skill("flow-plan");
+    let forbidden = "Review the draft above. Ready to file?";
+    assert!(
+        !content.contains(forbidden),
+        "skills/flow-plan/SKILL.md must not contain the wrap-up AskUserQuestion prompt `{}` (removed in PR #1489: Step 6 files directly after the decompose + transform pipeline)",
+        forbidden,
+    );
+}
+
+/// Tombstone: removed in PR #1489. `skills/flow-decompose-project/SKILL.md`
+/// no longer presents a Step 1 DAG-review AskUserQuestion gate. The
+/// user's invocation of `/flow:flow-decompose-project` is the single
+/// authorization for the decompose-and-file pipeline; the
+/// "Review the decomposition" prompt that used to ask for a second
+/// approval between Step 1 and Step 2 broke AC#4 of issue #1488.
+/// The phrase is a stable source literal (a full English sentence
+/// appearing in the SKILL prose), not assembled via `concat!`,
+/// `format!`, or constant composition.
+#[test]
+fn test_flow_decompose_project_no_dag_review_gate() {
+    let content = common::read_skill("flow-decompose-project");
+    let forbidden = "Review the decomposition";
+    assert!(
+        !content.contains(forbidden),
+        "skills/flow-decompose-project/SKILL.md must not contain the Step 1 DAG-review prompt `{}` (removed in PR #1489)",
+        forbidden,
+    );
+}
+
+/// Tombstone: removed in PR #1489. The flow-decompose-project skill
+/// no longer asks the user for a milestone due date in Step 2. The
+/// `bin/flow create-milestone` subcommand and the `--milestone` flag
+/// on `bin/flow issue` are removed as orphan infrastructure per
+/// `.claude/rules/supersession.md` because the only consumer (this
+/// skill's Step 2 + Step 3 milestone path) has been deleted. The
+/// forbidden phrase is the exact AskUserQuestion prompt the removed
+/// gate used.
+///
+/// Stability: the forbidden phrase is a stable source constant
+/// (fragment of a literal English prompt string in the SKILL.md
+/// prose). It is never produced by `concat!`, `format!`, or any
+/// other runtime string composition — the SKILL.md corpus does
+/// not programmatically build prompt strings.
+#[test]
+fn test_flow_decompose_project_no_due_date_prompt() {
+    let content = common::read_skill("flow-decompose-project");
+    let forbidden = "milestone due date (YYYY-MM-DD)";
+    assert!(
+        !content.contains(forbidden),
+        "skills/flow-decompose-project/SKILL.md must not contain the Step 2 milestone-due-date prompt `{}` (removed in PR #1489)",
+        forbidden,
+    );
+}
+
+/// Tombstone: removed in PR #1489.
+/// `skills/flow-decompose-project/SKILL.md` no longer invokes
+/// `bin/flow create-milestone` in Step 3 and no longer passes
+/// `--milestone` to `bin/flow issue` in Step 3 or Step 4. The
+/// subcommand is deleted from `src/create_milestone.rs`,
+/// `src/lib.rs`, and `src/main.rs` (see
+/// `test_src_no_create_milestone_module`). Both forbidden
+/// substrings are stable source literals — exact CLI subcommand
+/// names and a flag name that appear in skill bash blocks.
+///
+/// Stability: the forbidden substrings are stable source constants
+/// (exact CLI subcommand and flag names that appear verbatim in
+/// SKILL.md bash blocks). They are never produced by `concat!`,
+/// `format!`, or other runtime composition — bash blocks in
+/// SKILL.md are written as literal command text, never assembled
+/// programmatically.
+#[test]
+fn test_flow_decompose_project_no_create_milestone_invocation() {
+    let content = common::read_skill("flow-decompose-project");
+    assert!(
+        !content.contains("create-milestone"),
+        "skills/flow-decompose-project/SKILL.md must not invoke `bin/flow create-milestone` (subcommand removed in PR #1489)"
+    );
+    assert!(
+        !content.contains("--milestone"),
+        "skills/flow-decompose-project/SKILL.md must not pass `--milestone` to `bin/flow issue` (flag removed in PR #1489)"
+    );
+}
+
+/// Tombstone: removed in PR #1489. The validator-failure
+/// AskUserQuestion gates in Steps 3 and 4 of
+/// `flow-decompose-project` are replaced by bounded auto-fix loops.
+/// The two forbidden phrasings are the exact AskUserQuestion option
+/// labels the removed gates used.
+///
+/// Stability: both forbidden phrasings are stable source constants
+/// (literal English option-label strings appearing verbatim in
+/// SKILL.md prose). They are never produced by `concat!`,
+/// `format!`, or other runtime string composition.
+#[test]
+fn test_flow_decompose_project_no_validator_failure_gates() {
+    let content = common::read_skill("flow-decompose-project");
+    assert!(
+        !content.contains("Revise the epic body and retry"),
+        "skills/flow-decompose-project/SKILL.md must not contain the Step 3 validator-failure prompt option (removed in PR #1489)"
+    );
+    assert!(
+        !content.contains("Revise this child body and retry"),
+        "skills/flow-decompose-project/SKILL.md must not contain the Step 4 validator-failure prompt option (removed in PR #1489)"
+    );
+}
+
+/// Tombstone: removed in PR #1489. `src/create_milestone.rs` was
+/// the only producer the `bin/flow create-milestone` subcommand
+/// depended on; with the decompose-project skill no longer
+/// requesting a milestone, the subcommand became orphan
+/// infrastructure and is deleted per
+/// `.claude/rules/supersession.md`. This tombstone is structural:
+/// a file-existence check plus byte-substring scans of `src/lib.rs`
+/// and `src/main.rs` for the constant module-registration strings.
+///
+/// Stability: the scanned substrings (`pub mod create_milestone`,
+/// `CreateMilestone`) are exact Rust identifiers and module-
+/// declaration tokens that the compiler requires verbatim. They
+/// cannot be assembled by `concat!` or `format!` and still resolve
+/// at compile time — a future resurrection would have to write the
+/// literal strings the scan catches.
+#[test]
+fn test_src_no_create_milestone_module() {
+    let root = common::repo_root();
+    assert!(
+        !root.join("src").join("create_milestone.rs").exists(),
+        "src/create_milestone.rs must not exist — the subcommand was deleted in PR #1489"
+    );
+    let lib_content =
+        fs::read_to_string(root.join("src").join("lib.rs")).expect("src/lib.rs must exist");
+    assert!(
+        !lib_content.contains("pub mod create_milestone"),
+        "src/lib.rs must not declare `pub mod create_milestone` (removed in PR #1489)"
+    );
+    let main_content =
+        fs::read_to_string(root.join("src").join("main.rs")).expect("src/main.rs must exist");
+    assert!(
+        !main_content.contains("CreateMilestone"),
+        "src/main.rs must not reference `CreateMilestone` (variant + dispatch arm removed in PR #1489)"
+    );
+}
+
+/// Tombstone: removed in PR #1489. The `--milestone` flag on
+/// `bin/flow issue` is deleted along with `bin/flow create-milestone`.
+/// The scan is scoped to `src/issue.rs` because the codebase
+/// legitimately mentions `--milestone` elsewhere in historical
+/// contexts (release notes, changelogs); only the source file must
+/// be milestone-free.
+///
+/// Stability: the scanned strings (`--milestone`, `milestone`) are
+/// stable source constants — `--milestone` is the literal CLI flag
+/// name clap requires verbatim, and `milestone` is the Rust field
+/// identifier the compiler would require if the field were
+/// resurrected. Neither can be produced by `concat!` / `format!` at
+/// the call sites the scan covers (clap attribute strings and
+/// struct field declarations require compile-time literal tokens).
+#[test]
+fn test_src_issue_no_milestone_flag() {
+    let root = common::repo_root();
+    let issue_src =
+        fs::read_to_string(root.join("src").join("issue.rs")).expect("src/issue.rs must exist");
+    assert!(
+        !issue_src.contains("--milestone"),
+        "src/issue.rs must not reference `--milestone` (flag removed in PR #1489)"
+    );
+    assert!(
+        !issue_src.to_lowercase().contains("milestone"),
+        "src/issue.rs must not reference `milestone` (field + arg removed in PR #1489)"
+    );
+}
+
 // --- flow-create-issue prose corpus protection (PR #1486) ---
 
 /// Tombstone: removed in PR #1486. Must not return.
