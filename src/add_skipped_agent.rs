@@ -26,7 +26,36 @@ use crate::utils::now;
 /// Reasons an agent may be marked as skipped. Positive allowlist per
 /// `.claude/rules/security-gates.md` "Positive Allowlist, Not Negative
 /// Denylist".
-pub const ALLOWED_REASONS: &[&str] = &["rate_limit", "api_error", "other"];
+///
+/// `exhausted_retries` records an agent that the calling skill
+/// (flow-review Step 2, flow-learn Step 1) tried to invoke but gave
+/// up on after exceeding the retry cap (3 attempts) — the agent
+/// either truncated repeatedly, returned an external-failure marker,
+/// or failed transcript verification through
+/// `record-agent-return`. The phase-finalize required-agents gate
+/// (added in a later task) reads both `agents_returned` and
+/// `agents_skipped` so an exhausted-retry agent counts as
+/// accounted-for in the same way an `api_error`-skipped agent does.
+///
+/// **v1 boundary — skip reasons are procedural, not
+/// transcript-verified.** Unlike `record-agent-return` (which
+/// verifies via the persisted JSONL that an `Agent` `tool_use` +
+/// matching `tool_result` pair appears since the phase-enter
+/// marker), the skip path here writes the entry unconditionally. A
+/// model that calls `add-skipped-agent --reason exhausted_retries`
+/// without having actually retried three times satisfies the
+/// `agents_skipped` gate the same way a legitimate `api_error`
+/// entry does. The audit closure runs at Learn: each
+/// `exhausted_retries` entry is paired with a
+/// `state.notes` entry of kind `agent_exhausted_retries`
+/// (carrying attempt count + evidence pointer), which Learn
+/// surfaces in its "Missing analyses" report. Procedural
+/// enforcement of the retry cap lives in the calling SKILL.md's
+/// retry-3-then-note loop; a future PR may mechanically gate
+/// `exhausted_retries` against
+/// `phases.<phase>.agent_retry_counts.<agent> >= 3`, but that
+/// tightening is out of scope for v1.
+pub const ALLOWED_REASONS: &[&str] = &["rate_limit", "api_error", "other", "exhausted_retries"];
 
 #[derive(Parser, Debug)]
 #[command(
@@ -99,8 +128,8 @@ pub fn run_impl_main(args: &Args, root: &Path) -> (Value, i32) {
             json!({
                 "status": "error",
                 "message": format!(
-                    "reason must be one of {{rate_limit, api_error, other}}; got {:?}",
-                    args.reason
+                    "reason must be one of {:?}; got {:?}",
+                    ALLOWED_REASONS, args.reason
                 ),
             }),
             0,

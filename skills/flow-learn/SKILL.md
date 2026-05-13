@@ -231,6 +231,64 @@ markers, the agent exhausted its turn budget without producing structured
 output. Note for the Step 2 synthesis: "Learn-analyst agent exhausted
 turn budget without producing structured findings."
 
+### Per-agent accounting (record + retry-3-then-note)
+
+Account for the learn-analyst agent in state so the
+`phase-finalize` required-agents gate can confirm it ran.
+
+**Normal completion — record the return.** When the agent
+produced structured output cleanly, invoke `record-agent-return`
+to write the verified entry into
+`phases.flow-learn.agents_returned`. The subcommand reads the
+persisted Claude Code transcript and confirms the Agent
+tool_use/tool_result pair exists for `subagent_type:
+"flow:learn-analyst"` after the most recent `phase-enter --phase
+flow-learn` Bash marker — closing the inline-synthesis bypass
+where a model could write findings without actually invoking the
+agent.
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/flow record-agent-return --branch <branch> --agent learn-analyst --phase flow-learn
+```
+
+Parse the JSON output. If `status==ok`, the agent is accounted
+for. If `status==error` (reason `transcript_verification_failed`
+or any other), enter the retry path below.
+
+**Truncation, external failure, or recording failure — retry up
+to 3 attempts, then note.** Read
+`phases.flow-learn.agent_retry_counts.learn-analyst` from state
+(default `0`). If the count is less than 3, increment via
+`bin/flow set-timestamp` and re-invoke the agent with the same
+prompt:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/flow set-timestamp --set phases.flow-learn.agent_retry_counts.learn-analyst=<count+1>
+```
+
+If the count has reached 3, the agent has exhausted its retries.
+Record the skip and append a state note:
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/flow add-skipped-agent --branch <branch> --agent learn-analyst --reason exhausted_retries --phase flow-learn
+```
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/flow append-note <branch> agent_exhausted_retries "learn-analyst exhausted 3 retries during flow-learn"
+```
+
+<HARD-GATE>
+When the learn-analyst agent has exhausted retries, you MUST NOT
+synthesize its findings inline. The agent's analysis is
+unavailable for this Learn pass — record the skip via
+`add-skipped-agent` and the note via `append-note`, then proceed
+to Step 2 with the explicit acknowledgment that Tenant 1/2/3
+findings were not produced for this PR. Fabricating an agent's
+analysis from session memory defeats cognitive isolation per
+`.claude/rules/cognitive-isolation.md` "Never Supplement Agent
+Work From the Parent Session".
+</HARD-GATE>
+
 ---
 
 ## Step 2 — Synthesize findings
@@ -239,8 +297,22 @@ turn budget without producing structured findings."
 ${CLAUDE_PLUGIN_ROOT}/bin/flow set-timestamp --set learn_step=1
 ```
 
-Take the learn-analyst findings and sort them into three buckets
-matching the three tenants.
+**Read exhausted-retry notes first.** Before triaging
+learn-analyst findings, read `state.notes` and filter entries
+whose `kind` field equals `agent_exhausted_retries`. Each
+matching entry names an agent (this phase or Review) whose
+recording subcommand reached the retry cap (3 attempts) without
+verifying a clean return — the agent's analysis is unavailable
+for this Learn pass. Treat the exhausted-retry entries as
+"missing analyses" context for synthesis, NOT as findings the
+model attributes to the missing agent. Per
+`.claude/rules/cognitive-isolation.md` "Never Supplement Agent
+Work From the Parent Session", do not fabricate the missing
+agent's findings inline; the entries flow into the Step 7 report
+banner so the user sees which agents were unavailable.
+
+Take the learn-analyst findings (when present) and sort them
+into three buckets matching the three tenants.
 
 **Default is zero artifacts.** Most Learn phases produce no rule
 edits and no filed issues. The skill is an audit, not a writing
@@ -631,6 +703,11 @@ Present the full report to the user:
   ⚠ learn-analyst — partial findings (N of 3 categories
     completed)
 
+  Missing analyses
+  ----------------
+  ⚠ reviewer — exhausted 3 retries during flow-review
+  ⚠ learn-analyst — exhausted 3 retries during flow-learn
+
   Changes applied
   ---------------
   .claude/rules/testing-gotchas.md: 1 addition (committed)
@@ -647,8 +724,11 @@ Present the full report to the user:
 ````
 
 Omit "Truncated agent" if the learn-analyst was not flagged as truncated
-in Step 1. Omit "Changes applied" if no changes were made. Omit "Issues
-filed" if no issues were filed.
+in Step 1. Populate "Missing analyses" from the
+`agent_exhausted_retries` entries in `state.notes` filtered in Step 2;
+each line names the agent and the phase that exhausted retries. Omit
+the section entirely when no such notes exist. Omit "Changes applied"
+if no changes were made. Omit "Issues filed" if no issues were filed.
 
 In the "Changes applied" section, show "(committed)" or "(uncommitted)"
 next to each file to indicate whether Step 5 committed it. Show
@@ -670,7 +750,61 @@ ${CLAUDE_PLUGIN_ROOT}/bin/flow phase-finalize --phase flow-learn --branch <branc
 
 Omit `--thread-ts` if `slack_thread_ts` was not returned by `phase-enter`.
 
-Parse the JSON output. If `"status": "error"`, report the error and stop.
+Parse the JSON output.
+
+**Handle the `required_agent_not_returned` error reason.** When
+the response shape is
+`{"status":"error","reason":"required_agent_not_returned","missing":[...],"message":"..."}`,
+the learn-analyst agent is recorded in neither
+`agents_returned` nor `agents_skipped`. The required-agents
+gate ran before any state mutation. The phase has not been
+advanced.
+
+Three recovery shapes apply, ordered cheapest first:
+
+- **learn-analyst was invoked but `record-agent-return` was not
+  called.** The persisted transcript still carries the
+  `tool_use`/`tool_result` pair. Retroactively invoke the
+  recording subcommand:
+
+  ```bash
+  ${CLAUDE_PLUGIN_ROOT}/bin/flow record-agent-return --branch <branch> --agent learn-analyst --phase flow-learn
+  ```
+
+  When the response is `{"status":"ok",...}`, re-run
+  `phase-finalize`. When the response is
+  `{"status":"error","reason":"transcript_verification_failed"}`,
+  fall through to the next recovery shape.
+
+- **learn-analyst was never invoked (Step 1 loop bypassed).**
+  Re-invoke the agent from Step 1's prompt template, classify
+  the return, and either call `record-agent-return` (Class 3) or
+  `add-skipped-agent` (Class 1/2 after the 3-attempt cap). Then
+  re-run `phase-finalize`.
+
+- **learn-analyst cannot be retried in this session.** Record it
+  as skipped via the existing path:
+
+  ```bash
+  ${CLAUDE_PLUGIN_ROOT}/bin/flow add-skipped-agent --branch <branch> --agent learn-analyst --reason exhausted_retries --phase flow-learn
+  ```
+
+  Append a state note so the "Missing analyses" report surfaces
+  the gap:
+
+  ```bash
+  ${CLAUDE_PLUGIN_ROOT}/bin/flow append-note --branch <branch> --kind agent_exhausted_retries --agent learn-analyst --phase flow-learn --attempts 3 --evidence "missing from agents_returned at finalize time"
+  ```
+
+  Then re-run `phase-finalize` with `--accept-skipped-agents`.
+
+Do NOT advance to the COMPLETE banner until learn-analyst is
+accounted for AND a subsequent `phase-finalize` call returns
+`{"status":"ok",...}`.
+
+When the response is `{"status":"error", ...}` for any OTHER
+reason, report the error and stop.
+
 Use the `formatted_time` field in the COMPLETE banner below. Do not print
 the timing calculation.
 

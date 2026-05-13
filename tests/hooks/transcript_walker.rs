@@ -15,7 +15,8 @@ use flow_rs::hooks::transcript_walker::{
     last_user_message_invokes_skill, most_recent_skill_in_user_only_set,
     most_recent_skill_since_user, most_recent_user_message_since_skill_action,
     recent_edit_blocked_on_shared_config, user_message_contains_continue_token,
-    SHARED_CONFIG_BLOCK_BYTE_CAP, TRANSCRIPT_BYTE_CAP, USER_ONLY_SKILLS,
+    verify_agent_returned_in_phase, SHARED_CONFIG_BLOCK_BYTE_CAP, TRANSCRIPT_BYTE_CAP,
+    USER_ONLY_SKILLS,
 };
 
 // --- last_user_message_invokes_skill ---
@@ -1174,6 +1175,668 @@ fn most_recent_skill_unknown_turn_type_skipped() {
     assert_eq!(
         most_recent_skill_since_user(&path, home),
         Some("decompose:decompose".to_string()),
+    );
+}
+
+// --- verify_agent_returned_in_phase ---
+
+/// Helper: build a transcript fixture with three turn types woven
+/// together as needed for the verifier tests. Each fixture has the
+/// phase-enter Bash invocation in an assistant turn, then optionally
+/// an Agent tool_use, then optionally its tool_result.
+fn agent_turn_jsonl(
+    bash_marker: &str,
+    agent_block: Option<&str>,
+    result_block: Option<&str>,
+) -> String {
+    let bash_turn = format!(
+        "{{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_bash_1\",\"input\":{{\"command\":\"{}\"}}}}]}}}}\n",
+        bash_marker
+    );
+    let mut s = bash_turn;
+    if let Some(block) = agent_block {
+        s.push_str(block);
+    }
+    if let Some(block) = result_block {
+        s.push_str(block);
+    }
+    s
+}
+
+#[test]
+fn verify_agent_returned_rejects_unsafe_transcript_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Relative path is rejected by is_safe_transcript_path.
+    let relative = std::path::PathBuf::from("relative/path.jsonl");
+    assert_eq!(
+        verify_agent_returned_in_phase(&relative, home, "reviewer", "flow-review"),
+        Err("transcript_path_invalid".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_rejects_when_file_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // is_safe_transcript_path canonicalizes the path; a missing file
+    // fails canonicalize and is rejected as transcript_path_invalid.
+    // The validator collapses "doesn't exist" and "doesn't validate"
+    // into the same fail-closed result.
+    let missing = home
+        .join(".claude")
+        .join("projects")
+        .join("p")
+        .join("nonexistent.jsonl");
+    assert_eq!(
+        verify_agent_returned_in_phase(&missing, home, "reviewer", "flow-review"),
+        Err("transcript_path_invalid".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_phase_marker_not_found_when_agent_or_phase_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let path = crate::common::transcript_fixture(home, "p", "");
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", ""),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_phase_marker_not_found_when_no_phase_enter_in_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello\"}}\n\
+{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"no phase-enter here\"}]}}\n";
+    let path = crate::common::transcript_fixture(home, "p", jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_phase_marker_not_found_when_phase_enter_targets_other_phase() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // phase-enter --phase flow-code (not flow-review).
+    let jsonl = agent_turn_jsonl("bin/flow phase-enter --phase flow-code", None, None);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_tool_use_missing_when_no_agent_tool_use_after_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let jsonl = agent_turn_jsonl("bin/flow phase-enter --phase flow-review", None, None);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("tool_use_missing".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_tool_use_missing_when_subagent_type_mismatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_agent_1\",\"input\":{\"subagent_type\":\"flow:pre-mortem\"}}]}}\n";
+    let jsonl = agent_turn_jsonl(
+        "bin/flow phase-enter --phase flow-review",
+        Some(agent_block),
+        None,
+    );
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("tool_use_missing".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_tool_result_missing_when_no_matching_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_agent_1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let jsonl = agent_turn_jsonl(
+        "bin/flow phase-enter --phase flow-review",
+        Some(agent_block),
+        None,
+    );
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("tool_result_missing".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_returns_tool_result_missing_when_tool_use_id_mismatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_agent_1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    // Mismatched id on tool_result.
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_other\",\"content\":\"hi\"}]}}\n";
+    let jsonl = agent_turn_jsonl(
+        "bin/flow phase-enter --phase flow-review",
+        Some(agent_block),
+        Some(result_block),
+    );
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("tool_result_missing".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_happy_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_agent_1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_agent_1\",\"content\":\"findings here\"}]}}\n";
+    let jsonl = agent_turn_jsonl(
+        "bin/flow phase-enter --phase flow-review",
+        Some(agent_block),
+        Some(result_block),
+    );
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_normalizes_agent_and_phase_inputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_agent_1\",\"input\":{\"subagent_type\":\"flow:learn-analyst\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_agent_1\",\"content\":\"findings\"}]}}\n";
+    let jsonl = agent_turn_jsonl(
+        "bin/flow phase-enter --phase flow-learn",
+        Some(agent_block),
+        Some(result_block),
+    );
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    // Mixed-case + whitespace inputs should normalize to canonical
+    // values and find the agent.
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "  LEARN-ANALYST  ", "FLOW-LEARN"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_uses_most_recent_phase_enter() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // First phase-enter for flow-review with NO agent invocation.
+    // Then a later phase-enter for flow-review WITH agent + result.
+    // The verifier should anchor at the LAST phase-enter marker and
+    // succeed (not be fooled by the earlier one without agent).
+    let first = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let interior =
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"interim message\"}}\n";
+    let second = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b2\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"findings\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(first);
+    jsonl.push_str(interior);
+    jsonl.push_str(second);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_skips_agent_invocation_before_phase_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Agent tool_use + tool_result happen BEFORE the phase-enter
+    // marker. The forward walk from the marker sees no agent
+    // invocation and reports tool_use_missing.
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"findings\"}]}}\n";
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    jsonl.push_str(marker);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("tool_use_missing".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_succeeds_with_multi_tool_assistant_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Assistant turn carries Bash + Agent in the same content array.
+    // The Agent tool_use must still be discovered.
+    let marker_with_agent = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let combined = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"plan\"},{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker_with_agent);
+    jsonl.push_str(combined);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_ignores_malformed_jsonl_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let garbage = "this is not json\n\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"findings\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(garbage);
+    jsonl.push_str(marker);
+    jsonl.push_str(garbage);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(garbage);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_handles_oversized_transcript_via_tail_cap() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let proj = home.join(".claude").join("projects").join("p");
+    fs::create_dir_all(&proj).unwrap();
+    let path = proj.join("oversized.jsonl");
+    let head_marker = b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let mut content: Vec<u8> = head_marker.to_vec();
+    let padding_size = (TRANSCRIPT_BYTE_CAP as usize) + 1024;
+    content.extend(std::iter::repeat_n(b'\n', padding_size));
+    fs::write(&path, &content).unwrap();
+    // The marker is at the file's head; the tail-cap means it falls
+    // off the visible window and the verifier reports
+    // phase_marker_not_found.
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_reports_phase_marker_not_found_for_non_utf8_content() {
+    use std::fs;
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let proj = home.join(".claude").join("projects").join("p");
+    fs::create_dir_all(&proj).unwrap();
+    let path = proj.join("invalid-utf8.jsonl");
+    // Bytes that cannot be decoded as UTF-8. is_safe_transcript_path
+    // succeeds (path canonicalizes), but read_capped's
+    // read_to_string fails, returning None. The verifier then maps
+    // the None to phase_marker_not_found.
+    fs::write(&path, [0xFF, 0xFE, 0xFD]).unwrap();
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_ignores_assistant_turn_with_string_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // verify_agent_returned_in_phase runs three passes. (1) Backward
+    // scan over parsed lines locates the LAST phase-enter marker —
+    // here the assistant turn with the Bash tool_use. (2) Forward
+    // scan from marker+1 finds the Agent tool_use; the
+    // string_content assistant turn fails find_agent_tool_use_id's
+    // content.as_array check (string, not array) and the scan
+    // continues to agent_block. (3) Forward scan from marker+1 finds
+    // the matching tool_result; the string_content and agent_block
+    // turns both fail user_turn_carries_tool_result_for's
+    // type=="user" check, and the scan lands on result_block.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let string_content = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"plain text response\"}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(string_content);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_walks_past_real_user_turn_between_marker_and_agent() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Real user turn (string content) appears between the marker and
+    // the agent tool_use. find_agent_tool_use_id sees the user turn
+    // and returns None (turn_type != "assistant"), so the search
+    // continues to the agent block. user_turn_carries_tool_result_for
+    // also runs against this user turn during the result search and
+    // takes the "string content => not array" early-return branch.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let intervening_user =
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"continue please\"}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(intervening_user);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_skips_non_agent_tool_use_in_search_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // Assistant turn between marker and Agent contains a Bash
+    // tool_use that is NOT the target Agent. find_agent_tool_use_id
+    // hits the `name != "Agent" && name != "Task"` continue branch.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let other_bash = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b2\",\"input\":{\"command\":\"git status\"}}]}}\n";
+    let other_bash_result = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_b2\",\"content\":\"clean\"}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(other_bash);
+    jsonl.push_str(other_bash_result);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_skips_non_tool_result_block_in_result_search() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // After the agent tool_use, an unrelated tool_result for a Bash
+    // call appears first, then the matching tool_result follows.
+    // user_turn_carries_tool_result_for's `block.type != tool_result`
+    // continue branch is hit by the text content block inside the
+    // mixed user turn.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let mixed_user_turn = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"context\"},{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(mixed_user_turn);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+// --- verify_agent_returned_in_phase retry / marker discipline ---
+//
+// Per the Review pre-mortem findings P3 (find_agent_tool_use_id
+// first-match) and P5 (substring phase-marker match), the verifier
+// scan handles two additional cases beyond the basic happy path:
+//
+//   - Retried agent invocations: an agent that truncated/failed on
+//     its first attempt and succeeded on a later attempt produces
+//     two `tool_use` entries (different ids) and one `tool_result`
+//     (matched to the second id). The scan returns Ok the moment a
+//     `tool_result` matches ANY collected candidate id.
+//   - Token-aware phase-enter detection: the marker scan requires
+//     `bin/flow` (bare or absolute) then `phase-enter` as the
+//     command's first two tokens. Bash commands that mention the
+//     phase name as substring (e.g. `echo "phase-enter --phase
+//     flow-review"`, `bin/flow log "...phase-enter..."`) are not
+//     treated as phase boundaries.
+
+#[test]
+fn verify_agent_returned_accepts_retry_where_only_second_invocation_has_tool_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // marker → agent_block_1 (toolu_a1, NO matching tool_result) →
+    // agent_block_2 (toolu_a2, WITH matching tool_result). The
+    // forward scan collects both tool_use ids and returns Ok when
+    // the tool_result for toolu_a2 lands. Locks in the retry shape
+    // the SKILL.md retry-3-then-note loop produces when attempt #2
+    // succeeds after attempt #1 truncated.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let agent_block_1 = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let agent_block_2 = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a2\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block_2 = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a2\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(agent_block_1);
+    jsonl.push_str(agent_block_2);
+    jsonl.push_str(result_block_2);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_rejects_bash_log_substring_as_phase_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // The Bash command's first token is `bin/flow` but the second
+    // token is `log`, not `phase-enter`. The marker substring
+    // appears inside a quoted argument. cmd_invokes_phase_enter
+    // rejects on the tokens[1] != "phase-enter" check, so the scan
+    // does not pin to this turn. With no real phase-enter elsewhere,
+    // verification returns phase_marker_not_found.
+    let bash_log_substring = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow log b \\\"[Phase 3] phase-enter --phase flow-review beacon noted\\\"\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(bash_log_substring);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_rejects_echo_substring_as_phase_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // The Bash command's first token is `echo`, not `bin/flow`.
+    // cmd_invokes_phase_enter's first-token check rejects, so the
+    // marker scan does not pin to this turn even though the
+    // substring appears inside the argument.
+    let echo_substring = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"echo \\\"phase-enter --phase flow-review here\\\"\"}}]}}\n";
+    let jsonl = echo_substring.to_string();
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_accepts_absolute_bin_flow_path_in_phase_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // The Bash command's first token is an absolute path that ends
+    // with `/bin/flow`. cmd_invokes_phase_enter's first-token check
+    // accepts this form (matching the canonical
+    // `${CLAUDE_PLUGIN_ROOT}/bin/flow phase-enter ...` invocation in
+    // SKILL.md bash blocks). Verification succeeds.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"/Users/ben/code/flow/bin/flow phase-enter --phase flow-review --steps-total 4\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_rejects_phase_equals_wrong_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // The Bash command uses `--phase=other-phase` (= syntax) for a
+    // different phase than the verifier is searching for. The
+    // strip_prefix branch matches but `rest == phase` returns
+    // false. cmd_invokes_phase_enter falls through the loop and
+    // returns false, so no marker is found and verification
+    // returns phase_marker_not_found. Covers the else of the
+    // inner `if rest == phase` branch.
+    let marker_wrong_phase = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase=flow-code --steps-total=4\"}}]}}\n";
+    let jsonl = marker_wrong_phase.to_string();
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Err("phase_marker_not_found".to_string())
+    );
+}
+
+#[test]
+fn verify_agent_returned_walks_past_string_content_user_turn_between_agent_and_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // marker → agent_block (collect toolu_a1) → string_content_user
+    // → result_block. After candidate_ids has at least one id, the
+    // loop calls user_turn_carries_tool_result_for on the
+    // string-content user turn, which hits the
+    // `content.as_array → None` branch and returns false. The scan
+    // continues and lands on result_block, which matches.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let string_content_user =
+        "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"continue please\"}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(string_content_user);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_accepts_phase_equals_value_syntax() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // The phase argument uses `--phase=<value>` instead of space-
+    // separated `--phase <value>`. clap accepts both; the
+    // cmd_invokes_phase_enter strip_prefix branch matches the
+    // `--phase=` form so the marker scan accepts either invocation
+    // shape.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase=flow-review --steps-total=4\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_accepts_minimal_three_token_phase_equals_form() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // The minimum legitimate phase-enter invocation has 3 tokens:
+    // `bin/flow phase-enter --phase=flow-review`. Earlier P5 fix
+    // included a `tokens.len() < 4` check that rejected this 3-token
+    // form. cmd_invokes_phase_enter now requires only >= 3 tokens
+    // (tokens[0] = bin/flow, tokens[1] = phase-enter, tokens[2..] =
+    // phase flag scan).
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase=flow-review\"}}]}}\n";
+    let agent_block = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a1\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a1\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(agent_block);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_walks_past_id_less_agent_block_to_valid_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    // An assistant turn contains TWO Agent tool_use blocks for the
+    // same subagent: the first is malformed (no `id` field), the
+    // second is well-formed with id `toolu_a2`. find_agent_tool_use_id
+    // continues past the id-less block (instead of returning None on
+    // the first match) so the well-formed sibling is found. The
+    // tool_result for `toolu_a2` then completes the verification.
+    let marker = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let dual_agent_turn = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"input\":{\"subagent_type\":\"flow:reviewer\"}},{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"toolu_a2\",\"input\":{\"subagent_type\":\"flow:reviewer\"}}]}}\n";
+    let result_block = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_a2\",\"content\":\"ok\"}]}}\n";
+    let mut jsonl = String::new();
+    jsonl.push_str(marker);
+    jsonl.push_str(dual_agent_turn);
+    jsonl.push_str(result_block);
+    let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
     );
 }
 

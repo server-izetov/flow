@@ -357,6 +357,284 @@ pub fn most_recent_skill_since_user(path: &Path, home: &Path) -> Option<String> 
     last_skill
 }
 
+/// Verify that the agent named `agent` was invoked and returned a
+/// `tool_result` after the most recent `phase-enter --phase <phase>`
+/// Bash invocation in the persisted transcript. Returns `Ok(())` on
+/// match; `Err(<reason>)` names the first verification step that
+/// failed.
+///
+/// Production consumer: `bin/flow record-agent-return` — the
+/// recording subcommand calls this verifier before appending to
+/// `phases.<phase>.agents_returned` in state. The verification
+/// prevents inline-synthesis bypass: a model that did not actually
+/// invoke the agent (and so produced no `tool_use`/`tool_result`
+/// pair in the persisted transcript) cannot fabricate the state
+/// entry.
+///
+/// Failure reasons (string-typed for `record_agent_return`'s JSON
+/// error envelope):
+///
+/// - `"transcript_path_invalid"` — `path` fails
+///   `is_safe_transcript_path`. The validator rejects empty paths,
+///   NUL bytes, relative paths, ParentDir components, and paths that
+///   do not normalize under `<home>/.claude/projects/`.
+/// - `"phase_marker_not_found"` — no `phase-enter --phase <phase>`
+///   Bash tool_use is visible in the file's tail (read via
+///   `read_capped` with `TRANSCRIPT_BYTE_CAP`), OR `agent`/`phase`
+///   normalize to an empty string, OR the file cannot be read /
+///   parsed at all.
+/// - `"tool_use_missing"` — no Agent tool_use with
+///   `input.subagent_type == "flow:<agent>"` appears AFTER the most
+///   recent phase-enter marker.
+/// - `"tool_result_missing"` — the Agent tool_use was found but no
+///   matching `tool_result` with the same `tool_use_id` appears
+///   AFTER the marker.
+///
+/// The verifier anchors at the LAST phase-enter marker for `phase` so
+/// agent invocations from a prior pass through the phase (rare, but
+/// possible on resume) cannot satisfy a later round's required-agents
+/// gate. Lines that fail to parse as JSON are silently skipped — the
+/// walker's behavior on malformed input is fail-open at the line
+/// level so a corrupted JSONL row does not poison the entire scan.
+///
+/// `home` is passed in (rather than read from `$HOME` internally) so
+/// the validator can run against a fixture-controlled prefix in
+/// tests without `set_var` env races. CLI callers
+/// (`record_agent_return::run`) read `$HOME` via
+/// `crate::session_metrics::home_dir_or_empty()` and pass it
+/// through.
+pub fn verify_agent_returned_in_phase(
+    path: &Path,
+    home: &Path,
+    agent: &str,
+    phase: &str,
+) -> Result<(), String> {
+    if !is_safe_transcript_path(path, home) {
+        return Err("transcript_path_invalid".to_string());
+    }
+    let agent_norm = normalize_gate_input(agent);
+    let phase_norm = normalize_gate_input(phase);
+    if agent_norm.is_empty() || phase_norm.is_empty() {
+        return Err("phase_marker_not_found".to_string());
+    }
+    let lines = match read_capped(path, TRANSCRIPT_BYTE_CAP) {
+        Some(s) => s,
+        None => return Err("phase_marker_not_found".to_string()),
+    };
+    let all_lines: Vec<&str> = lines.lines().collect();
+    let mut marker_idx: Option<usize> = None;
+    for (i, line) in all_lines.iter().enumerate().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let turn: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if assistant_turn_runs_phase_enter(&turn, &phase_norm) {
+            marker_idx = Some(i);
+            break;
+        }
+    }
+    let marker_idx = match marker_idx {
+        Some(i) => i,
+        None => return Err("phase_marker_not_found".to_string()),
+    };
+    let subagent_needle = format!("flow:{}", agent_norm);
+    // Single forward scan that collects every matching Agent
+    // tool_use_id AND watches for a tool_result whose tool_use_id
+    // matches any collected id. Retried agent invocations (first
+    // attempt truncated/failed, second attempt clean) produce
+    // multiple tool_use entries with distinct ids and exactly one
+    // tool_result for the successful attempt — returning on the
+    // first matching pair handles that shape. A single-pass scan
+    // also handles the happy-path single-invocation case in fewer
+    // turns than the prior two-pass form.
+    let mut candidate_ids: Vec<String> = Vec::new();
+    for line in all_lines.iter().skip(marker_idx + 1) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let turn: Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if let Some(id) = find_agent_tool_use_id(&turn, &subagent_needle) {
+            candidate_ids.push(id);
+        }
+        for id in &candidate_ids {
+            if user_turn_carries_tool_result_for(&turn, id) {
+                return Ok(());
+            }
+        }
+    }
+    if candidate_ids.is_empty() {
+        Err("tool_use_missing".to_string())
+    } else {
+        Err("tool_result_missing".to_string())
+    }
+}
+
+/// Returns `true` when `turn` is an assistant turn that fires a Bash
+/// tool_use whose `input.command` is a `bin/flow phase-enter --phase
+/// <phase>` invocation (bare `bin/flow` or any absolute path ending in
+/// `/bin/flow`). Used by `verify_agent_returned_in_phase` to locate
+/// the `phase-enter --phase <phase>` boundary.
+///
+/// The match is token-aware (`cmd_invokes_phase_enter`) rather than
+/// substring. An unrelated command whose text contains the marker
+/// substring — `echo "phase-enter --phase flow-review"`,
+/// `bin/flow log "...phase-enter --phase flow-review..."` — does NOT
+/// match, so the verifier's scan window cannot be pinned to the wrong
+/// boundary by a casual log entry that mentions the phase name.
+fn assistant_turn_runs_phase_enter(turn: &Value, phase: &str) -> bool {
+    let turn_type = normalize_gate_input(turn.get("type").and_then(|v| v.as_str()).unwrap_or(""));
+    if turn_type != "assistant" {
+        return false;
+    }
+    let content = match turn
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return false,
+    };
+    for block in content {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+            continue;
+        }
+        if block.get("name").and_then(|v| v.as_str()) != Some("Bash") {
+            continue;
+        }
+        let cmd = block
+            .get("input")
+            .and_then(|i| i.get("command"))
+            .and_then(|c| c.as_str())
+            .unwrap_or("");
+        if cmd_invokes_phase_enter(cmd, phase) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Token-aware check: `cmd` is a `bin/flow phase-enter --phase
+/// <phase>` invocation. Tokens 0/1 must be `(bin/flow|*/bin/flow)`
+/// then `phase-enter`. The phase name must appear as the next token
+/// after a literal `--phase` token OR as the suffix of a
+/// `--phase=<phase>` token. Rejects substring false positives by
+/// requiring the command's first two tokens to match the canonical
+/// invocation shape — see `.claude/rules/comment-quality.md` for
+/// why the comment names what the match excludes.
+fn cmd_invokes_phase_enter(cmd: &str, phase: &str) -> bool {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    // The 3-token form `bin/flow phase-enter --phase=value` collapses
+    // the phase flag and value into a single token; the 4-token form
+    // `bin/flow phase-enter --phase value` keeps them separated. Both
+    // are valid clap invocations, so the minimum token count is 3 —
+    // tokens[0] and tokens[1] are the safe-indexed checks below, and
+    // the loop at skip(2) walks any remaining tokens for the phase
+    // value (= form or space form).
+    if tokens.len() < 3 {
+        return false;
+    }
+    let first = tokens[0];
+    if first != "bin/flow" && !first.ends_with("/bin/flow") {
+        return false;
+    }
+    if tokens[1] != "phase-enter" {
+        return false;
+    }
+    for (i, tok) in tokens.iter().enumerate().skip(2) {
+        if *tok == "--phase" && tokens.get(i + 1) == Some(&phase) {
+            return true;
+        }
+        if let Some(rest) = tok.strip_prefix("--phase=") {
+            if rest == phase {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns the `id` of the first Agent tool_use in `turn` whose
+/// `input.subagent_type` (normalized) equals `subagent_needle`.
+/// Returns `None` when the turn is not an assistant turn, when no
+/// Agent block matches, or when the matching block lacks an `id`
+/// field. Recognized tool names are `"Agent"` and `"Task"` —
+/// Claude Code's transcripts use one or the other for sub-agent
+/// invocations depending on version.
+fn find_agent_tool_use_id(turn: &Value, subagent_needle: &str) -> Option<String> {
+    let turn_type = normalize_gate_input(turn.get("type").and_then(|v| v.as_str()).unwrap_or(""));
+    if turn_type != "assistant" {
+        return None;
+    }
+    let content = turn
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())?;
+    for block in content {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_use") {
+            continue;
+        }
+        let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name != "Agent" && name != "Task" {
+            continue;
+        }
+        let sa = block
+            .get("input")
+            .and_then(|i| i.get("subagent_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if normalize_gate_input(sa) == subagent_needle {
+            // A matching subagent block without an `id` field is
+            // malformed — continue the loop so a later well-formed
+            // sibling block in the same turn's content array still
+            // contributes its id. Returning None here would skip
+            // valid siblings and force the caller's retry loop
+            // (`verify_agent_returned_in_phase`) to falsely conclude
+            // `tool_use_missing`.
+            if let Some(id) = block.get("id").and_then(|v| v.as_str()) {
+                return Some(id.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Returns `true` when `turn` is a user turn whose content array
+/// carries a `tool_result` block with `tool_use_id == target_id`.
+/// String-content user turns (the user typed prose) do not satisfy
+/// the check; only the array-content shape (tool_result-wrapped user
+/// turns) is examined.
+fn user_turn_carries_tool_result_for(turn: &Value, target_id: &str) -> bool {
+    let turn_type = normalize_gate_input(turn.get("type").and_then(|v| v.as_str()).unwrap_or(""));
+    if turn_type != "user" {
+        return false;
+    }
+    let content = match turn
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+    {
+        Some(c) => c,
+        None => return false,
+    };
+    for block in content {
+        if block.get("type").and_then(|v| v.as_str()) != Some("tool_result") {
+            continue;
+        }
+        if block.get("tool_use_id").and_then(|v| v.as_str()) == Some(target_id) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Return the most recent string-content user-role turn AFTER the
 /// FIRST assistant Skill `tool_use` in the transcript at
 /// `transcript_path`. Returns `None` when no Skill call has fired,
