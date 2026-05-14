@@ -1,5 +1,44 @@
 # Release Notes
 
+## v2.1.0 — Halt model, per-agent models, walker shape parity
+
+### New features
+
+- **Two-exit halt model for autonomous flows** — when a user
+  messages mid-flow, the next Stop refusal names exactly two
+  exits: `/flow:flow-continue` to resume or `/flow:flow-abort`
+  to close. `_halt_pending` persists across every Stop until
+  the user types one of the two slash commands. Halt gates on
+  the Skill and Bash tool surfaces close the route-around
+  surface (#1543).
+- **Per-sub-agent model selection** — every plugin sub-agent
+  now binds a specific model (opus / sonnet / haiku) with a
+  rationale comment in `agents/<name>.md`. Review tier uses
+  opus for reviewer/pre-mortem/adversarial, sonnet for
+  documentation, haiku for learn-analyst (#1546).
+- **`bin/setup` and plugin docs** — bundled setup script and
+  refreshed installation docs for target projects (#1539).
+
+### Improvements
+
+- **flow-prime simplified** — fewer prompts, clearer presets,
+  consistent Start carve-out (#1552).
+- **flow-issues dashboard grouping** — issues grouped by
+  status with native blocked-by surfacing (#1549).
+- **Walker accepts Claude Code 2.1.140+ slash-command shape** —
+  user-only-skill enforcement now recognizes both the legacy
+  one-line and the new two-line slash-command emission shapes
+  via `starts_with` disjunction (#1556).
+
+### Fixes
+
+- **Done section accurate** — Complete-phase Done banner now
+  includes the decompose plugin install step (#1541).
+- **flow-release commit unblocked** — Layer 9 bootstrap-skill
+  carve-out normalizes skill names symmetrically with the
+  walker via `normalize_gate_input`; tolerates case and
+  whitespace variants (#1533).
+
 ## v2.0.1 — Setup script, verified agent returns, release-commit unblock
 
 ### Improvements
