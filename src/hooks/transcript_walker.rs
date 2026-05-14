@@ -116,11 +116,12 @@ use serde_json::Value;
 
 use crate::session_metrics::is_safe_transcript_path;
 
-/// The four FLOW skills the model must never invoke. Each requires
+/// The five FLOW skills the model must never invoke. Each requires
 /// explicit user initiative — the user types the slash command
 /// directly — because the action is destructive (`flow-abort`,
-/// `flow-reset`), resource-shipping (`flow-release`), or
-/// environment-mutating (`flow-prime`).
+/// `flow-reset`), resource-shipping (`flow-release`),
+/// environment-mutating (`flow-prime`), or autonomy-resuming
+/// (`flow-continue`).
 ///
 /// Re-exported by `validate_skill` and `validate_ask_user` so a
 /// single authoritative list governs both Layer 1 (block model
@@ -129,21 +130,23 @@ use crate::session_metrics::is_safe_transcript_path;
 /// caller input through `normalize_gate_input` before checking
 /// membership.
 ///
-/// Namespacing asymmetry: `flow-abort`, `flow-reset`, and
-/// `flow-prime` are plugin-marketplace skills at
-/// `skills/<name>/SKILL.md`, so Claude Code emits the namespaced
-/// `flow:<name>` form when the user types `/flow:<name>`.
-/// `flow-release` is a project-local maintainer skill at
-/// `.claude/skills/flow-release/`, so Claude Code emits the bare
-/// name `flow-release` when the user types `/flow-release`. The
-/// constant reflects the literal `input.skill` values the
-/// `validate-skill` PreToolUse hook observes; mixing the two shapes
-/// is intentional and load-bearing.
+/// Namespacing asymmetry: `flow-abort`, `flow-reset`,
+/// `flow-prime`, and `flow-continue` are plugin-marketplace skills
+/// at `skills/<name>/SKILL.md`, so Claude Code emits the
+/// namespaced `flow:<name>` form when the user types
+/// `/flow:<name>`. `flow-release` is a project-local maintainer
+/// skill at `.claude/skills/flow-release/`, so Claude Code emits
+/// the bare name `flow-release` when the user types
+/// `/flow-release`. The constant reflects the literal
+/// `input.skill` values the `validate-skill` PreToolUse hook
+/// observes; mixing the two shapes is intentional and load-
+/// bearing.
 pub const USER_ONLY_SKILLS: &[&str] = &[
     "flow:flow-abort",
     "flow:flow-reset",
     "flow-release",
     "flow:flow-prime",
+    "flow:flow-continue",
 ];
 
 /// Maximum bytes read from the transcript file (50 MB). Bounds I/O
@@ -215,18 +218,49 @@ fn is_real_user_turn(turn: &Value) -> bool {
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
         .is_some();
-    // `isMeta` arrives over the JSONL wire as a JSON value whose
-    // type Claude Code does not contractually pin to `bool`. Older
-    // captures, hand-edited transcripts, and external tools can
-    // emit truthy `isMeta` values as `"true"`, `"1"`, or non-zero
-    // numbers. `is_truthy` accepts every truthy form the security-
-    // enforcement hooks already tolerate elsewhere in this module
-    // (per `.claude/rules/rust-patterns.md` "Hook Input Boolean
-    // Field Tolerance"). A raw `as_bool()` would silently
-    // misclassify non-bool truthy values as synthetic=false,
-    // re-opening the autonomous-flow-halt bypass surface.
-    let is_meta = is_truthy(turn.get("isMeta"));
+    // `isMeta` discrimination uses asymmetric fail-closed semantics:
+    // any value that is NOT explicitly absent, `null`, or `false`
+    // classifies as synthetic. This is stricter than `is_truthy`
+    // (which classifies arrays/objects/strings-like-"foo" as
+    // falsy — appropriate for halt-pending fail-open semantics, but
+    // wrong for the `isMeta` discrimination contract).
+    //
+    // The threat surface: a hostile or malformed transcript line
+    // with `isMeta:[true]`, `isMeta:{}`, `isMeta:"yes"`, or any
+    // non-canonical truthy shape would be classified as real by
+    // `is_truthy` (which returns false for those shapes), bypassing
+    // Layer 1's user-only-skill enforcement when the line also
+    // carries `<command-name>/<skill></command-name>` content.
+    // Treating every non-canonical `isMeta` shape as synthetic
+    // closes the bypass — at the cost of dropping a hypothetical
+    // legitimate `isMeta:false` turn that the producer accidentally
+    // wrote as `isMeta:"false"`, which is preferable to the
+    // alternative.
+    //
+    // Per `.claude/rules/transcript-shape.md` "The Closed Catalog
+    // of Synthetic User Turns".
+    let is_meta = is_meta_marker_present(turn.get("isMeta"));
     content_is_string && !is_meta
+}
+
+/// Asymmetric truthy check for the `isMeta` discriminator. Returns
+/// `true` when the value indicates a synthetic turn — any value
+/// other than explicit absence (`None`), `null`, or `Bool(false)`.
+/// Numeric `0` and string `"false"` count as synthetic (fail
+/// closed) to defend against hostile or malformed transcript lines.
+///
+/// This differs from `is_truthy` (which classifies arrays/objects
+/// as falsy) because the synthetic-turn discriminator must err
+/// toward "treat as synthetic" rather than "treat as real" —
+/// misclassifying a synthetic turn as real reopens the user-only-
+/// skill bypass surface per `.claude/rules/transcript-shape.md`.
+fn is_meta_marker_present(v: Option<&Value>) -> bool {
+    match v {
+        None => false,
+        Some(Value::Null) => false,
+        Some(Value::Bool(false)) => false,
+        Some(_) => true,
+    }
 }
 
 /// Return `true` when the most recent user-role turn in the
@@ -893,144 +927,29 @@ pub fn most_recent_user_message_since_skill_action(
         if !seen_skill {
             continue;
         }
-        // Only string-content user turns count. Synthetic
-        // tool_result-wrapped user turns carry assistant-generated
-        // tool output, not user prose, and must not satisfy the
-        // halt-pause trigger.
-        if let Some(s) = turn
+        // Only REAL user turns count, per
+        // `.claude/rules/transcript-shape.md` "The Mechanical
+        // Contract". Synthetic tool_result-wrapped user turns
+        // (array content) and hook-injected feedback turns
+        // (string content + `isMeta:true`) must both be skipped —
+        // either shape misclassified as real prose would
+        // falsely trigger the halt-pause contract.
+        if !is_real_user_turn(&turn) {
+            continue;
+        }
+        // `is_real_user_turn` already verified `message.content`
+        // is a string, so the `as_str()` cannot return None here
+        // — the `.expect` is documentation of that guarantee, not
+        // a reachable panic. Per
+        // `.claude/rules/testability-means-simplicity.md`.
+        let s = turn
             .get("message")
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
-        {
-            candidate = Some(s.to_string());
-        }
+            .expect("is_real_user_turn guarantees string content");
+        candidate = Some(s.to_string());
     }
     candidate
-}
-
-/// Returns `true` when `msg` contains a continue-token at a word
-/// boundary. The closed token set is `continue`, `resume`,
-/// `proceed`, `go ahead`, `keep going` — the tokens that clear the
-/// `_halt_pending` state set by `check_halt_pending` in
-/// `src/hooks/stop_continue.rs` per
-/// `.claude/rules/autonomous-phase-discipline.md` "Explicit User
-/// Pause Directives".
-///
-/// Comparison is case-insensitive (the input is ASCII-lowercased
-/// once at entry). Word boundaries reject substrings inside larger
-/// words: `discontinue`, `resumed`, `proceedings` do NOT match.
-/// Trailing punctuation (`continue.`, `continue!`, `continue,`) is
-/// permitted because the punctuation is a non-word character.
-/// Two-word tokens tolerate one or more whitespace characters
-/// between the words (`go ahead`, `go  ahead`, `go\tahead`) but
-/// reject concatenated forms (`goahead`, `keepgoing`) — the first
-/// word must end at a word boundary before the second word begins.
-///
-/// Pure function: no I/O, no allocations beyond the lowercased
-/// input buffer.
-pub fn user_message_contains_continue_token(msg: &str) -> bool {
-    if msg.is_empty() {
-        return false;
-    }
-    // Strip NUL bytes before lowercasing per
-    // `.claude/rules/security-gates.md` "Normalize Before
-    // Comparing". A NUL byte is non-alphanumeric and would
-    // otherwise satisfy the word-boundary check at position 0,
-    // so a `"\0continue"` user message would clear `_halt_pending`
-    // even though the user did not type a continue directive.
-    let lower = msg.replace('\0', "").to_ascii_lowercase();
-    if lower.is_empty() {
-        return false;
-    }
-    let bytes = lower.as_bytes();
-    for token in ["continue", "resume", "proceed"] {
-        if find_token_with_boundary(bytes, token.as_bytes()) {
-            return true;
-        }
-    }
-    for (first, second) in [("go", "ahead"), ("keep", "going")] {
-        if find_two_word_token(bytes, first.as_bytes(), second.as_bytes()) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Word characters are ASCII alphanumerics plus underscore — the
-/// standard regex `\w` definition. Continue-token word boundaries
-/// require the character on each side of the token to be either
-/// outside the buffer or non-word.
-fn is_word_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
-/// Scan `haystack` for `needle` at every position where the
-/// preceding byte is outside the buffer or non-word AND the
-/// following byte is outside the buffer or non-word. Both buffers
-/// are ASCII (the caller lowercases the input).
-fn find_token_with_boundary(haystack: &[u8], needle: &[u8]) -> bool {
-    let nlen = needle.len();
-    let hlen = haystack.len();
-    if nlen == 0 || nlen > hlen {
-        return false;
-    }
-    let last_start = hlen - nlen;
-    for start in 0..=last_start {
-        if &haystack[start..start + nlen] != needle {
-            continue;
-        }
-        let before_ok = start == 0 || !is_word_byte(haystack[start - 1]);
-        let end = start + nlen;
-        let after_ok = end == hlen || !is_word_byte(haystack[end]);
-        if before_ok && after_ok {
-            return true;
-        }
-    }
-    false
-}
-
-/// Scan `haystack` for `first <whitespace+> second` with word
-/// boundaries on the outer edges and a word boundary at the end of
-/// `first` before whitespace. Tolerates any run of ASCII
-/// whitespace between the words but rejects zero-whitespace
-/// concatenations.
-fn find_two_word_token(haystack: &[u8], first: &[u8], second: &[u8]) -> bool {
-    let flen = first.len();
-    let slen = second.len();
-    let hlen = haystack.len();
-    if flen == 0 || slen == 0 || flen + 1 + slen > hlen {
-        return false;
-    }
-    let last_start = hlen - flen;
-    for start in 0..=last_start {
-        if &haystack[start..start + flen] != first {
-            continue;
-        }
-        let before_ok = start == 0 || !is_word_byte(haystack[start - 1]);
-        if !before_ok {
-            continue;
-        }
-        let after_first = start + flen;
-        if after_first >= hlen || is_word_byte(haystack[after_first]) {
-            continue;
-        }
-        let mut pos = after_first;
-        while pos < hlen && haystack[pos].is_ascii_whitespace() {
-            pos += 1;
-        }
-        if pos + slen > hlen {
-            continue;
-        }
-        if &haystack[pos..pos + slen] != second {
-            continue;
-        }
-        let end = pos + slen;
-        let after_ok = end == hlen || !is_word_byte(haystack[end]);
-        if after_ok {
-            return true;
-        }
-    }
-    false
 }
 
 /// Read the LAST `cap` bytes of `path` as a UTF-8 String. Returns
@@ -1164,12 +1083,15 @@ pub fn recent_edit_blocked_on_shared_config(transcript_path: &Path, home: &Path)
             .and_then(|m| m.get("content"))
             .and_then(|c| c.as_str())
             .is_some();
-        // `is_truthy` accepts bool, `"true"`/`"1"` strings, and
-        // non-zero numbers per `.claude/rules/rust-patterns.md`
-        // "Hook Input Boolean Field Tolerance" — matching the
-        // discriminator in `is_real_user_turn` so the two
-        // walkers cannot diverge on non-bool `isMeta` shapes.
-        let is_meta = is_truthy(turn.get("isMeta"));
+        // Use the asymmetric `is_meta_marker_present` predicate so
+        // the targeted skip here matches the discriminator in
+        // `is_real_user_turn`. Both walkers must classify
+        // hook-feedback turns identically regardless of the exact
+        // `isMeta` shape — array, object, or non-canonical string
+        // — to close the bypass surface where a crafted JSONL line
+        // can pass as real prose. See
+        // `.claude/rules/transcript-shape.md`.
+        let is_meta = is_meta_marker_present(turn.get("isMeta"));
         if is_string_content && is_meta {
             continue;
         }
@@ -1249,7 +1171,11 @@ fn user_turn_carries_shared_config_block(turn: &Value) -> bool {
 /// `"true"` / `"1"` (case-insensitive), and any non-zero number.
 /// Everything else (including `null`, `false`, empty string,
 /// non-truthy strings, and `0`) is `false`.
-fn is_truthy(v: Option<&Value>) -> bool {
+///
+/// Public because `validate_skill` and `validate_pretool` halt
+/// gates read state-file `_halt_pending` and must tolerate the same
+/// truthy shapes the walker tolerates for `isMeta` discrimination.
+pub fn is_truthy(v: Option<&Value>) -> bool {
     match v {
         Some(Value::Bool(b)) => *b,
         Some(Value::String(s)) => {
