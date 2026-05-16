@@ -53,18 +53,35 @@
 //! paths, relative paths, paths containing a `..` component, and
 //! paths that do not normalize under `<home>/.claude/projects/`.
 //!
-//! ## Tail-bounded read
+//! ## Three lookback windows
 //!
-//! `read_capped` seeks to the LAST `cap` bytes of the file and reads
-//! forward to EOF, with the consumed read hard-bounded at `cap` via
-//! `file.take(cap)`. The walker iterates the resulting buffer in
-//! reverse line order, so the file's tail (the most recent turns) is
-//! always visible regardless of total file size. The two callers
-//! choose different caps tuned to their recency needs:
-//! `TRANSCRIPT_BYTE_CAP` (50 MB) for user-only-skill detection
-//! across long autonomous flows, and `SHARED_CONFIG_BLOCK_BYTE_CAP`
-//! (4 MB) for shared-config carve-out detection where only the most
-//! recent user-role turn matters.
+//! Walkers declare their lookback semantics by name. Three public
+//! wrappers route every file read:
+//!
+//! - `read_full` — uncapped. Loads the entire transcript. Used by
+//!   phase-boundary verifiers (`verify_agent_returned_in_phase`)
+//!   whose marker may sit arbitrarily far back in a long autonomous
+//!   flow's transcript.
+//! - `read_recency_window` — capped at `TRANSCRIPT_BYTE_CAP` (50 MB).
+//!   Used by per-turn recency walkers (`last_user_message_invokes_skill`,
+//!   `most_recent_skill_in_user_only_set`,
+//!   `most_recent_user_message_since_skill_action`,
+//!   `most_recent_skill_since_user`, `any_skill_in_set_since_user`)
+//!   where the marker of interest is among the most recent ~10,000
+//!   turns and the hot path must stay bounded.
+//! - `read_recent_turns` — capped at `SHARED_CONFIG_BLOCK_BYTE_CAP`
+//!   (4 MB). Used by `recent_edit_blocked_on_shared_config` which
+//!   only needs the latest assistant tool call and its paired
+//!   tool_result.
+//!
+//! The private `read_capped` is the seek-and-take primitive both
+//! `read_recency_window` and `read_recent_turns` wrap. Direct calls
+//! to `read_capped` from production code outside this module are
+//! forbidden — the contract test
+//! `read_capped_only_called_inside_named_helpers` in
+//! `tests/hooks/transcript_walker.rs` locks the invariant in, and
+//! `.claude/rules/transcript-walker-cap.md` documents the API for
+//! future authors.
 //!
 //! ## Gate normalization
 //!
@@ -161,13 +178,18 @@ pub const USER_ONLY_SKILLS: &[&str] = &[
     "flow:flow-continue",
 ];
 
-/// Maximum bytes read from the transcript file (50 MB). Bounds I/O
-/// across long autonomous flows — a session transcript can exceed
-/// 100 MB, and reading every byte on every Skill /
-/// AskUserQuestion tool call would dominate session latency.
-/// `read_capped` reads the LAST `TRANSCRIPT_BYTE_CAP` bytes (not
-/// the first), so the most recent ~10,000 turns are always
-/// reachable regardless of total file size.
+/// Recency-window cap (50 MB) for per-turn walkers that need to
+/// find a marker among the most recent ~10,000 turns. Wrapped by
+/// `read_recency_window`, which seeks to the LAST `TRANSCRIPT_BYTE_CAP`
+/// bytes of the transcript and reads forward to EOF. Bounds I/O on
+/// the per-turn hot path so a session transcript that grows past
+/// 100 MB cannot dominate latency on every Skill / AskUserQuestion
+/// tool call.
+///
+/// Phase-boundary verifiers that may need to look past this window
+/// (`verify_agent_returned_in_phase`) use `read_full` instead — the
+/// uncapped path. The cap is therefore the *recency-window* limit,
+/// not a global transcript-read limit.
 pub const TRANSCRIPT_BYTE_CAP: u64 = 50 * 1024 * 1024;
 
 /// Smaller tail-bounded cap (4 MB) for shared-config block detection.
@@ -343,7 +365,7 @@ pub fn last_user_message_invokes_skill(path: &Path, skill: &str, home: &Path) ->
     if skill_norm.is_empty() {
         return false;
     }
-    let lines = match read_capped(path, TRANSCRIPT_BYTE_CAP) {
+    let lines = match read_recency_window(path) {
         Some(s) => s,
         None => return false,
     };
@@ -401,7 +423,7 @@ pub fn most_recent_skill_in_user_only_set(path: &Path, home: &Path) -> bool {
     if !is_safe_transcript_path(path, home) {
         return false;
     }
-    let lines = match read_capped(path, TRANSCRIPT_BYTE_CAP) {
+    let lines = match read_recency_window(path) {
         Some(s) => s,
         None => return false,
     };
@@ -498,7 +520,7 @@ pub fn any_skill_in_set_since_user(path: &Path, home: &Path, sanctioned: &[&str]
     if sanctioned.is_empty() {
         return false;
     }
-    let lines = match read_capped(path, TRANSCRIPT_BYTE_CAP) {
+    let lines = match read_recency_window(path) {
         Some(s) => s,
         None => return false,
     };
@@ -606,7 +628,7 @@ pub fn most_recent_skill_since_user(path: &Path, home: &Path) -> Option<String> 
     if !is_safe_transcript_path(path, home) {
         return None;
     }
-    let lines = read_capped(path, TRANSCRIPT_BYTE_CAP)?;
+    let lines = read_recency_window(path)?;
     let mut last_skill: Option<String> = None;
     for line in lines.lines().rev() {
         let trimmed = line.trim();
@@ -681,10 +703,13 @@ pub fn most_recent_skill_since_user(path: &Path, home: &Path) -> Option<String> 
 ///   NUL bytes, relative paths, ParentDir components, and paths that
 ///   do not normalize under `<home>/.claude/projects/`.
 /// - `"phase_marker_not_found"` — no `phase-enter --phase <phase>`
-///   Bash tool_use is visible in the file's tail (read via
-///   `read_capped` with `TRANSCRIPT_BYTE_CAP`), OR `agent`/`phase`
-///   normalize to an empty string, OR the file cannot be read /
-///   parsed at all.
+///   Bash tool_use is visible in the transcript (read uncapped via
+///   `read_full`), OR `agent`/`phase` normalize to an empty string,
+///   OR the file cannot be read / parsed at all. The verifier reads
+///   the full transcript rather than the 50 MB tail because the
+///   `phase-enter` marker for a long-running phase can sit
+///   arbitrarily far back; a tail-bounded read would silently miss
+///   it on autonomous flows whose transcript grows past the cap.
 /// - `"tool_use_missing"` — no Agent tool_use with
 ///   `input.subagent_type == "flow:<agent>"` appears AFTER the most
 ///   recent phase-enter marker.
@@ -719,7 +744,7 @@ pub fn verify_agent_returned_in_phase(
     if agent_norm.is_empty() || phase_norm.is_empty() {
         return Err("phase_marker_not_found".to_string());
     }
-    let lines = match read_capped(path, TRANSCRIPT_BYTE_CAP) {
+    let lines = match read_full(path) {
         Some(s) => s,
         None => return Err("phase_marker_not_found".to_string()),
     };
@@ -974,9 +999,9 @@ fn user_turn_carries_tool_result_for(turn: &Value, target_id: &str) -> bool {
 /// `transcript_path` runs through
 /// `crate::session_metrics::is_safe_transcript_path` (rejects
 /// empty, NUL-byte, relative, ParentDir-component, and prefix-
-/// escaping paths). File reads are bounded by the caller-supplied
-/// `cap` via `BufReader::new(file.take(cap))` so a corrupted or
-/// hostile transcript cannot cause unbounded I/O.
+/// escaping paths). File reads are bounded by `read_recency_window`
+/// (50 MB tail) so a corrupted or hostile transcript cannot cause
+/// unbounded I/O on the per-turn hot path.
 ///
 /// `home` is passed in (rather than read from `$HOME` inside) so
 /// fixture-controlled tests can isolate from the real user
@@ -984,12 +1009,11 @@ fn user_turn_carries_tool_result_for(turn: &Value, target_id: &str) -> bool {
 pub fn most_recent_user_message_since_skill_action(
     transcript_path: &Path,
     home: &Path,
-    cap: u64,
 ) -> Option<String> {
     if !is_safe_transcript_path(transcript_path, home) {
         return None;
     }
-    let lines = read_capped(transcript_path, cap)?;
+    let lines = read_recency_window(transcript_path)?;
     let mut candidate: Option<String> = None;
     let mut seen_skill = false;
     for line in lines.lines() {
@@ -1048,6 +1072,66 @@ pub fn most_recent_user_message_since_skill_action(
     candidate
 }
 
+/// Read the entire `path` as a UTF-8 String. Returns `None` on
+/// `File::open` error, non-UTF-8 content, or other I/O failure.
+///
+/// Uncapped read: the entire file content is loaded into memory.
+/// Callers that walk to a phase-boundary marker that may sit
+/// arbitrarily far back in the transcript — `verify_agent_returned_in_phase`
+/// is the canonical consumer — use `read_full` because a tail-bounded
+/// read can hide the marker on long autonomous flows. The trade-off
+/// is memory: a 200 MB transcript loads 200 MB of working memory.
+/// Acceptable for phase-boundary verification because the verifier
+/// runs at most once per agent return (rare) rather than per-turn.
+///
+/// For recency-window reads (per-turn hot path), use
+/// `read_recency_window` instead. For shared-config-block detection,
+/// use `read_recent_turns`. Direct calls to `read_capped` from
+/// production code are forbidden by the contract test in
+/// `tests/hooks/transcript_walker.rs` —
+/// `.claude/rules/transcript-walker-cap.md` documents the API.
+pub fn read_full(path: &Path) -> Option<String> {
+    std::fs::read_to_string(path).ok()
+}
+
+/// Read the LAST `TRANSCRIPT_BYTE_CAP` (50 MB) bytes of `path` as a
+/// UTF-8 String. Returns `None` on `File::open` error, non-UTF-8
+/// content, or other I/O failure.
+///
+/// Recency-window read: the byte cap bounds backward visibility to
+/// the most recent ~10,000 turns. Callers that need to find a marker
+/// in the recent past — most-recent user turn, most-recent assistant
+/// Skill call, paired tool_use/tool_result for the latest
+/// AskUserQuestion — use `read_recency_window` because the cap keeps
+/// the per-turn hot path bounded as transcripts grow past 100 MB.
+///
+/// The canonical consumer class is the per-turn walker family:
+/// `last_user_message_invokes_skill`,
+/// `most_recent_skill_in_user_only_set`,
+/// `most_recent_user_message_since_skill_action`,
+/// `most_recent_skill_since_user`,
+/// `any_skill_in_set_since_user`. Phase-boundary verifiers that may
+/// need to look further back use `read_full` instead.
+pub fn read_recency_window(path: &Path) -> Option<String> {
+    read_capped(path, TRANSCRIPT_BYTE_CAP)
+}
+
+/// Read the LAST `SHARED_CONFIG_BLOCK_BYTE_CAP` (4 MB) bytes of
+/// `path` as a UTF-8 String. Returns `None` on `File::open` error,
+/// non-UTF-8 content, or other I/O failure.
+///
+/// Recent-turns read: the smaller cap reflects that the consumer
+/// (`recent_edit_blocked_on_shared_config`) only needs the most
+/// recent 1-2 turns since the most recent real user turn — the
+/// latest assistant tool call and its paired tool_result. 4 MB
+/// comfortably holds those turns even when they include large file
+/// contents in `tool_use.input` or `tool_result.content`, and the
+/// smaller cap keeps the AskUserQuestion-blocked hot path faster
+/// than `read_recency_window` would.
+pub fn read_recent_turns(path: &Path) -> Option<String> {
+    read_capped(path, SHARED_CONFIG_BLOCK_BYTE_CAP)
+}
+
 /// Read the LAST `cap` bytes of `path` as a UTF-8 String. Returns
 /// `None` on `File::open` error or non-UTF-8 content.
 ///
@@ -1059,15 +1143,14 @@ pub fn most_recent_user_message_since_skill_action(
 /// parse and is silently skipped by the walker's `Err(_) => continue`
 /// branch.
 ///
-/// The `cap` parameter lets callers tune the backward-visibility
-/// window to the recency the walker needs.
-/// `last_user_message_invokes_skill` and
-/// `most_recent_skill_in_user_only_set` pass `TRANSCRIPT_BYTE_CAP`
-/// (50 MB) because user-only-skill detection may need to look past
-/// many recent assistant turns. `recent_edit_blocked_on_shared_config`
-/// passes the smaller `SHARED_CONFIG_BLOCK_BYTE_CAP` (4 MB) because
-/// it only needs the most recent assistant tool call and its paired
-/// tool_result.
+/// Direct calls to `read_capped` from production code outside this
+/// module are forbidden. Three public wrappers carry the lookback
+/// semantics by name: `read_full` (uncapped, phase-boundary
+/// verifiers), `read_recency_window` (50 MB, per-turn recency
+/// walkers), `read_recent_turns` (4 MB, shared-config-block
+/// detection). The contract test
+/// `read_capped_only_called_inside_named_helpers` in
+/// `tests/hooks/transcript_walker.rs` locks the invariant in.
 ///
 /// `metadata()` and `seek()` on a freshly-opened regular file are
 /// genuinely TOCTOU-only failure modes per the
@@ -1126,8 +1209,9 @@ fn read_capped(path: &Path, cap: u64) -> Option<String> {
 /// confirm with the user" and `validate-ask-user` simultaneously
 /// blocks AskUserQuestion.
 ///
-/// Walks lines backward from the file tail (read via `read_capped`
-/// with `SHARED_CONFIG_BLOCK_BYTE_CAP`) and stops at the most recent
+/// Walks lines backward from the file tail (read via
+/// `read_recent_turns`, capped at `SHARED_CONFIG_BLOCK_BYTE_CAP`)
+/// and stops at the most recent
 /// user-role turn — examining ONLY that turn's content. The carve-
 /// out fires iff the latest interaction the model received from the
 /// user-role channel was the shared-config block. If any other
@@ -1147,7 +1231,7 @@ pub fn recent_edit_blocked_on_shared_config(transcript_path: &Path, home: &Path)
     if !is_safe_transcript_path(transcript_path, home) {
         return false;
     }
-    let lines = match read_capped(transcript_path, SHARED_CONFIG_BLOCK_BYTE_CAP) {
+    let lines = match read_recent_turns(transcript_path) {
         Some(s) => s,
         None => return false,
     };

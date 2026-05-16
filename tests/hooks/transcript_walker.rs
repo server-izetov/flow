@@ -14,9 +14,9 @@ use std::fs;
 use flow_rs::hooks::transcript_walker::{
     any_skill_in_set_since_user, last_user_message_invokes_skill,
     most_recent_skill_in_user_only_set, most_recent_skill_since_user,
-    most_recent_user_message_since_skill_action, recent_edit_blocked_on_shared_config,
-    verify_agent_returned_in_phase, SHARED_CONFIG_BLOCK_BYTE_CAP, TRANSCRIPT_BYTE_CAP,
-    USER_ONLY_SKILLS,
+    most_recent_user_message_since_skill_action, read_full, read_recency_window, read_recent_turns,
+    recent_edit_blocked_on_shared_config, verify_agent_returned_in_phase,
+    SHARED_CONFIG_BLOCK_BYTE_CAP, TRANSCRIPT_BYTE_CAP, USER_ONLY_SKILLS,
 };
 
 // --- last_user_message_invokes_skill ---
@@ -1592,28 +1592,6 @@ fn verify_agent_returned_ignores_malformed_jsonl_lines() {
 }
 
 #[test]
-fn verify_agent_returned_handles_oversized_transcript_via_tail_cap() {
-    use std::fs;
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    let proj = home.join(".claude").join("projects").join("p");
-    fs::create_dir_all(&proj).unwrap();
-    let path = proj.join("oversized.jsonl");
-    let head_marker = b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_b1\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
-    let mut content: Vec<u8> = head_marker.to_vec();
-    let padding_size = (TRANSCRIPT_BYTE_CAP as usize) + 1024;
-    content.extend(std::iter::repeat_n(b'\n', padding_size));
-    fs::write(&path, &content).unwrap();
-    // The marker is at the file's head; the tail-cap means it falls
-    // off the visible window and the verifier reports
-    // phase_marker_not_found.
-    assert_eq!(
-        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
-        Err("phase_marker_not_found".to_string())
-    );
-}
-
-#[test]
 fn verify_agent_returned_reports_phase_marker_not_found_for_non_utf8_content() {
     use std::fs;
     let dir = tempfile::tempdir().unwrap();
@@ -1731,6 +1709,52 @@ fn verify_agent_returned_skips_non_tool_result_block_in_result_search() {
     jsonl.push_str(agent_block);
     jsonl.push_str(mixed_user_turn);
     let path = crate::common::transcript_fixture(home, "p", &jsonl);
+    assert_eq!(
+        verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
+        Ok(())
+    );
+}
+
+#[test]
+fn verify_agent_returned_finds_phase_marker_in_oversized_transcript() {
+    // Guards the invariant that verify_agent_returned_in_phase finds
+    // the phase-enter marker even when the transcript exceeds
+    // TRANSCRIPT_BYTE_CAP. The fixture places the phase-enter Bash
+    // marker at byte 0, pads with filler turns past the cap, and
+    // places the Agent tool_use plus its paired tool_result at the
+    // tail. The verifier must return Ok(()) — a tail-bounded read
+    // would seek past the head marker and return
+    // Err("phase_marker_not_found"), so the test fails the moment
+    // the verifier's read window shrinks below the whole-file scope.
+    //
+    // Memory profile: the fixture is composed as a single String and
+    // written via one fs::write, allocating ~51 MB transiently.
+    // Acceptable on any modern dev machine; test runtime is roughly
+    // 1-2s on SSD.
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let proj = home.join(".claude").join("projects").join("oversized");
+    fs::create_dir_all(&proj).unwrap();
+    let path = proj.join("session.jsonl");
+
+    let marker_turn = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Bash\",\"id\":\"toolu_bash_marker\",\"input\":{\"command\":\"bin/flow phase-enter --phase flow-review\"}}]}}\n";
+    let agent_turn = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Agent\",\"id\":\"test-id-1\",\"input\":{\"subagent_type\":\"flow:reviewer\",\"description\":\"review\",\"prompt\":\"x\"}}]}}\n";
+    let result_turn = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"test-id-1\",\"content\":\"ok\"}]}}\n";
+    let filler = "{\"type\":\"system\",\"message\":{\"role\":\"system\",\"content\":\"filler\"}}\n";
+
+    let padding_target = (TRANSCRIPT_BYTE_CAP as usize) + 1024 * 1024;
+    let filler_count = padding_target / filler.len() + 1;
+    let mut content = String::with_capacity(
+        marker_turn.len() + filler_count * filler.len() + agent_turn.len() + result_turn.len(),
+    );
+    content.push_str(marker_turn);
+    for _ in 0..filler_count {
+        content.push_str(filler);
+    }
+    content.push_str(agent_turn);
+    content.push_str(result_turn);
+    fs::write(&path, content.as_bytes()).unwrap();
+
     assert_eq!(
         verify_agent_returned_in_phase(&path, home, "reviewer", "flow-review"),
         Ok(())
@@ -1984,7 +2008,7 @@ fn most_recent_user_message_since_skill_action_returns_string_content_user_turn_
 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"wait, hold up\"}}\n";
     let path = crate::common::transcript_fixture(home, "p", jsonl);
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&path, home),
         Some("wait, hold up".to_string()),
     );
 }
@@ -2002,7 +2026,7 @@ fn most_recent_user_message_since_skill_action_skips_tool_result_array_wrappers(
 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"real prose\"}}\n";
     let path = crate::common::transcript_fixture(home, "p", jsonl);
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&path, home),
         Some("real prose".to_string()),
     );
 }
@@ -2018,7 +2042,7 @@ fn most_recent_user_message_since_skill_action_returns_none_when_no_user_turn_af
 {\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"flow:flow-code\"}}]}}\n";
     let path = crate::common::transcript_fixture(home, "p", jsonl);
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&path, home),
         None,
     );
 }
@@ -2036,32 +2060,7 @@ fn most_recent_user_message_since_skill_action_returns_none_when_no_skill_action
 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"goodbye\"}}\n";
     let path = crate::common::transcript_fixture(home, "p", jsonl);
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
-        None,
-    );
-}
-
-#[test]
-fn most_recent_user_message_since_skill_action_byte_cap_regression() {
-    // A user turn + Skill call sit at the file's HEAD, then padding
-    // pushes them past the tail cap. The capped read sees only the
-    // tail bytes, which have no parseable Skill call — helper
-    // returns `None`. Locks in the byte-cap bound per
-    // `.claude/rules/external-input-path-construction.md`.
-    let dir = tempfile::tempdir().unwrap();
-    let home = dir.path();
-    let proj = home.join(".claude").join("projects").join("p");
-    fs::create_dir_all(&proj).unwrap();
-    let path = proj.join("byte-cap.jsonl");
-    let leading = b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"flow:flow-code\"}}]}}\n\
-{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"buried\"}}\n";
-    let small_cap: u64 = 1024;
-    let mut content: Vec<u8> = leading.to_vec();
-    let padding_size = (small_cap as usize) + 1024;
-    content.extend(std::iter::repeat_n(b'\n', padding_size));
-    fs::write(&path, &content).unwrap();
-    assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, small_cap),
+        most_recent_user_message_since_skill_action(&path, home),
         None,
     );
 }
@@ -2079,7 +2078,7 @@ fn most_recent_user_message_since_skill_action_rejects_unsafe_transcript_path() 
     let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"go\"}}\n";
     fs::write(&stray, jsonl).unwrap();
     assert_eq!(
-        most_recent_user_message_since_skill_action(&stray, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&stray, home),
         None,
     );
 }
@@ -2099,8 +2098,26 @@ fn most_recent_user_message_since_skill_action_non_utf8_file_returns_none() {
     // continuation byte), so the pair is invalid UTF-8.
     fs::write(&path, [0xC3u8, 0x28u8]).unwrap();
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&path, home),
         None,
+    );
+}
+
+#[test]
+fn most_recent_user_message_since_skill_action_skips_empty_lines() {
+    // A blank line between the Skill call and the user turn must be
+    // skipped via the `if trimmed.is_empty() { continue; }` branch
+    // without affecting the candidate. JSONL transcripts can carry
+    // blank lines from interrupted writes or hand-edits.
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let jsonl = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"flow:flow-code\"}}]}}\n\
+\n\
+{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hold up\"}}\n";
+    let path = crate::common::transcript_fixture(home, "p", jsonl);
+    assert_eq!(
+        most_recent_user_message_since_skill_action(&path, home),
+        Some("hold up".to_string()),
     );
 }
 
@@ -2117,7 +2134,7 @@ not valid json at all\n\
 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hold up\"}}\n";
     let path = crate::common::transcript_fixture(home, "p", jsonl);
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&path, home),
         Some("hold up".to_string()),
     );
 }
@@ -2136,7 +2153,7 @@ fn most_recent_user_message_since_skill_action_unknown_turn_type_skipped() {
 {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hold up\"}}\n";
     let path = crate::common::transcript_fixture(home, "p", jsonl);
     assert_eq!(
-        most_recent_user_message_since_skill_action(&path, home, TRANSCRIPT_BYTE_CAP),
+        most_recent_user_message_since_skill_action(&path, home),
         Some("hold up".to_string()),
     );
 }
@@ -2979,4 +2996,240 @@ fn last_user_message_invokes_skill_skips_user_turn_with_missing_content() {
         "flow:flow-abort",
         home,
     ));
+}
+
+// --- read_full / read_recency_window / read_recent_turns ---
+
+#[test]
+fn read_full_returns_full_file_content() {
+    // Build a file > 50 MB with a unique marker line at byte 0.
+    // `read_full` is uncapped, so the returned String must contain
+    // the marker — proving the read covered the entire file, not
+    // just the tail. The fixture allocates ~51 MB transiently
+    // (one composed String + one fs::write), which is acceptable on
+    // any modern dev machine.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized.txt");
+    let marker = "UNIQUE-MARKER-AT-HEAD\n";
+    let padding_size = (TRANSCRIPT_BYTE_CAP as usize) + 1024;
+    let mut content = String::with_capacity(marker.len() + padding_size);
+    content.push_str(marker);
+    content.extend(std::iter::repeat_n('x', padding_size));
+    fs::write(&path, content.as_bytes()).unwrap();
+    let result = read_full(&path).expect("read_full returns Some on existing readable file");
+    assert!(
+        result.contains(marker),
+        "read_full must cover head bytes, not just tail",
+    );
+}
+
+#[test]
+fn read_full_returns_none_on_missing_file() {
+    // No file at the path. `std::fs::read_to_string` fails with
+    // ENOENT, `.ok()` converts to None. Matches the fail-open
+    // semantics of the underlying `read_capped` error path.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("does-not-exist.txt");
+    assert_eq!(read_full(&missing), None);
+}
+
+#[test]
+fn read_recency_window_caps_at_50mb() {
+    // File > 50 MB. `read_recency_window` calls
+    // `read_capped(path, TRANSCRIPT_BYTE_CAP)` which seeks to the
+    // file's tail and reads at most `TRANSCRIPT_BYTE_CAP` bytes.
+    // The returned String length must be <= TRANSCRIPT_BYTE_CAP.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recency.txt");
+    let total_size = (TRANSCRIPT_BYTE_CAP as usize) + 1024;
+    let content: Vec<u8> = std::iter::repeat_n(b'x', total_size).collect();
+    fs::write(&path, &content).unwrap();
+    let result =
+        read_recency_window(&path).expect("read_recency_window returns Some on readable file");
+    assert!(
+        result.len() as u64 <= TRANSCRIPT_BYTE_CAP,
+        "read_recency_window must cap at TRANSCRIPT_BYTE_CAP; got {} bytes",
+        result.len(),
+    );
+}
+
+#[test]
+fn read_recency_window_returns_none_on_missing_file() {
+    // Missing file → File::open fails → `read_capped` returns None.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.txt");
+    assert_eq!(read_recency_window(&missing), None);
+}
+
+#[test]
+fn read_recent_turns_caps_at_4mb() {
+    // File > 4 MB. `read_recent_turns` calls
+    // `read_capped(path, SHARED_CONFIG_BLOCK_BYTE_CAP)` which seeks
+    // to the file's tail and reads at most
+    // `SHARED_CONFIG_BLOCK_BYTE_CAP` bytes. The returned String
+    // length must be <= SHARED_CONFIG_BLOCK_BYTE_CAP.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("recent.txt");
+    let total_size = (SHARED_CONFIG_BLOCK_BYTE_CAP as usize) + 1024;
+    let content: Vec<u8> = std::iter::repeat_n(b'x', total_size).collect();
+    fs::write(&path, &content).unwrap();
+    let result = read_recent_turns(&path).expect("read_recent_turns returns Some on readable file");
+    assert!(
+        result.len() as u64 <= SHARED_CONFIG_BLOCK_BYTE_CAP,
+        "read_recent_turns must cap at SHARED_CONFIG_BLOCK_BYTE_CAP; got {} bytes",
+        result.len(),
+    );
+}
+
+#[test]
+fn read_recent_turns_returns_none_on_missing_file() {
+    // Missing file → File::open fails → `read_capped` returns None.
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.txt");
+    assert_eq!(read_recent_turns(&missing), None);
+}
+
+// --- read_capped invariant (contract test) ---
+
+/// Returns the slice of `src` starting at `marker` and ending at the
+/// next `\n}\n` (function-body terminator). Panics if `marker` is
+/// missing. Used by `read_capped_only_called_inside_named_helpers`
+/// to bound the assertion scope to each helper's body per
+/// `.claude/rules/testing-gotchas.md` "Subsection-Local Assertions
+/// in Contract Tests".
+fn extract_fn_body<'a>(src: &'a str, marker: &str) -> &'a str {
+    let tail = src
+        .split_once(marker)
+        .map(|(_, t)| t)
+        .unwrap_or_else(|| panic!("marker `{}` not found in source", marker));
+    tail.split_once("\n}\n")
+        .map(|(body, _)| body)
+        .unwrap_or(tail)
+}
+
+#[test]
+fn read_capped_only_called_inside_named_helpers() {
+    // Locks the API in: `read_capped` is the private primitive; the
+    // three named wrappers (`read_full`, `read_recency_window`,
+    // `read_recent_turns`) are the only production callers. A future
+    // edit that adds a direct `read_capped(` call outside those
+    // wrappers — or that fails to migrate a new caller to one of the
+    // wrappers — fails this contract test.
+    //
+    // Implementation per `.claude/rules/testing-gotchas.md`
+    // "Subsection-Local Assertions in Contract Tests": bound each
+    // helper's body via `split_once("pub fn <name>(")` and the
+    // following `\n}\n` to keep counts scoped to that function's
+    // body. Bounding by `\n}\n` works because every helper's body
+    // ends with a single closing brace on its own line — Rust
+    // rustfmt formatting guarantees the shape.
+    let src =
+        std::fs::read_to_string(crate::common::repo_root().join("src/hooks/transcript_walker.rs"))
+            .expect("read src/hooks/transcript_walker.rs");
+
+    // Use a runtime-composed needle so the contract test file itself
+    // never contains the literal `read_capped(` byte sequence outside
+    // its own assertion strings — keeps the test self-consistent if
+    // anyone later extends the scanner to scan `tests/`.
+    let needle: String = ["read", "_capped("].concat();
+    let needle_str = needle.as_str();
+
+    let read_full_body = extract_fn_body(&src, "pub fn read_full(");
+    let read_recency_body = extract_fn_body(&src, "pub fn read_recency_window(");
+    let read_recent_body = extract_fn_body(&src, "pub fn read_recent_turns(");
+
+    assert_eq!(
+        read_full_body.matches(needle_str).count(),
+        0,
+        "read_full body must not call read_capped (it uses fs::read_to_string)"
+    );
+    assert_eq!(
+        read_recency_body.matches(needle_str).count(),
+        1,
+        "read_recency_window body must call read_capped exactly once"
+    );
+    assert_eq!(
+        read_recent_body.matches(needle_str).count(),
+        1,
+        "read_recent_turns body must call read_capped exactly once"
+    );
+
+    // Total occurrences in the file:
+    // - 1 inside read_recency_window body (counted above)
+    // - 1 inside read_recent_turns body (counted above)
+    // - 1 in the `fn read_capped(` definition itself
+    // Anything else means a direct caller exists outside the three
+    // named wrappers — the contract is broken.
+    let total = src.matches(needle_str).count();
+    assert_eq!(
+        total, 3,
+        "read_capped( appears {} times in transcript_walker.rs; \
+         expected exactly 3 (1 in each capped helper + 1 in the fn definition)",
+        total
+    );
+
+    // Every other `src/*.rs` file must contain zero `read_capped(`
+    // calls. The literal is module-private (Rust visibility would
+    // already reject it at compile time), but the contract test
+    // makes the invariant explicit so a future change that exposes
+    // `read_capped` as `pub` and adds an outside caller trips here.
+    let src_dir = crate::common::repo_root().join("src");
+    let mut rust_files: Vec<std::path::PathBuf> = Vec::new();
+    collect_rust_files(&src_dir, &mut rust_files);
+    let walker_path = crate::common::repo_root().join("src/hooks/transcript_walker.rs");
+    let walker_canon = walker_path
+        .canonicalize()
+        .expect("canonicalize walker path");
+    for path in &rust_files {
+        let path_canon = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if path_canon == walker_canon {
+            continue;
+        }
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        assert!(
+            !content.contains(needle_str),
+            "{} contains `{}` — only the three named helpers in \
+             src/hooks/transcript_walker.rs may call read_capped",
+            path.display(),
+            needle_str
+        );
+    }
+}
+
+/// Walk `src/` and collect every `.rs` file path. Mirrors the helper
+/// in `tests/test_placement.rs` — duplicated here because Cargo's
+/// directory-form test layout for `tests/hooks/` does not allow
+/// importing helpers from sibling top-level test files.
+fn collect_rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.starts_with('.') || name == "target" {
+            continue;
+        }
+        let meta = match std::fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_rust_files(&path, out);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
 }
