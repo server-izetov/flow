@@ -8,7 +8,12 @@
 #                                               prints terse summary, exit 0
 #   bin/test tests/<path>/<name>.rs           — per-file mode; fail fast
 #   bin/test tests/<path>/<name>.rs --audit   — per-file mode; never fails
-#   bin/test --file <path> [args...]          — single file via rustc --test (dev)
+#   bin/test --file <path> [args...]          — alias for `bin/test <path>`
+#                                               (PER_FILE mode via cargo nextest);
+#                                               kept so the Review adversarial
+#                                               agent's documented command shape
+#                                               (`bin/flow ci --test --file <probe>`)
+#                                               continues to work.
 #   bin/test --check <module> [args...]       — fast lib tests, no coverage (dev)
 #   bin/test --report                         — re-render cached coverage (dev)
 #   bin/test --show <file>                    — annotated source for ONE
@@ -97,14 +102,15 @@ fi
 # --- Dev-only modes (unchanged behavior) ---
 
 if [ "${1:-}" = "--file" ]; then
+  # `--file <path>` is an alias for the path-positional form
+  # `bin/test <path>` so the Review adversarial agent's documented
+  # `bin/flow ci --test --file <probe>` command shape works without
+  # falling into bare-rustc compilation (which has no `--extern`,
+  # `-L`, or `CARGO_MANIFEST_DIR` and cannot link a probe against
+  # the workspace crate). Shift `--file` off and fall through to
+  # the PER_FILE arm below, which dispatches to cargo nextest with
+  # full crate access.
   shift
-  file="$1"
-  shift
-  temp_bin=".flow-test-binary"
-  trap 'rm -f "$temp_bin"' EXIT
-  rustc --test "$file" -o "$temp_bin"
-  ./"$temp_bin" "$@"
-  exit
 fi
 
 if [ "${1:-}" = "--check" ]; then

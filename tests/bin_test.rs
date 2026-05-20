@@ -2,7 +2,9 @@
 //!
 //! `bin/test` has two modes:
 //!   - Default: forwards trailing args to `cargo nextest run`
-//!   - `--file <path>`: compiles the file with `rustc --test` and runs it
+//!   - `--file <path>`: alias for `bin/test <path>` (PER_FILE mode),
+//!     dispatching to cargo nextest with `--test <basename>` so the
+//!     probe links against the workspace crate.
 
 mod common;
 
@@ -142,9 +144,16 @@ fn forwards_trailing_args_to_nextest() {
     );
 }
 
-/// `bin/test --file <path>` invokes rustc --test on the file.
+/// `bin/test --file <path>` is an alias for `bin/test <path>`
+/// (PER_FILE mode): it dispatches to `cargo nextest run --test
+/// <basename>` so the probe compiles against the workspace crate.
+/// The earlier bare-`rustc --test` dispatch could not link probes
+/// that referenced the crate, `serde_json`, `tempfile`, or
+/// `#[path]` helpers; the Review adversarial agent's documented
+/// `bin/flow ci --test --file <probe>` command needs full crate
+/// access to execute crate-using probes.
 #[test]
-fn file_mode_invokes_rustc_test() {
+fn file_mode_dispatches_to_cargo_nextest_with_test_binary_filter() {
     let dir = tempfile::tempdir().unwrap();
     let bin_dir = dir.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
@@ -157,21 +166,24 @@ fn file_mode_invokes_rustc_test() {
     perms.set_mode(0o755);
     fs::set_permissions(&target, perms).unwrap();
 
-    // Mock rustc that "compiles" by creating a no-op binary at the -o path
+    let tests_dir = dir.path().join("tests");
+    fs::create_dir_all(&tests_dir).unwrap();
+    fs::write(tests_dir.join("foo.rs"), "// fixture").unwrap();
+
     let mock_bin = dir.path().join("mock_bin");
     fs::create_dir_all(&mock_bin).unwrap();
-    let log_file = dir.path().join("rustc_log");
+    let log_file = dir.path().join("cargo_log");
     fs::write(
-        mock_bin.join("rustc"),
+        mock_bin.join("cargo"),
         format!(
-            "#!/usr/bin/env bash\necho \"$*\" > \"{}\"\n# Find the -o argument and write a runnable script there\nout=\"\"\nfor i in \"$@\"; do\n  if [ \"$prev\" = \"-o\" ]; then out=\"$i\"; break; fi\n  prev=\"$i\"\ndone\nif [ -n \"$out\" ]; then\n  echo '#!/usr/bin/env bash' > \"$out\"\n  echo 'exit 0' >> \"$out\"\n  chmod +x \"$out\"\nfi\nexit 0\n",
+            "#!/usr/bin/env bash\necho \"$*\" >> \"{}\"\nexit 0\n",
             log_file.display()
         ),
     )
     .unwrap();
-    let mut perms = fs::metadata(mock_bin.join("rustc")).unwrap().permissions();
+    let mut perms = fs::metadata(mock_bin.join("cargo")).unwrap().permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(mock_bin.join("rustc"), perms).unwrap();
+    fs::set_permissions(mock_bin.join("cargo"), perms).unwrap();
 
     let path = format!("{}:{}", mock_bin.display(), std::env::var("PATH").unwrap());
     let output = Command::new(&target)
@@ -187,13 +199,18 @@ fn file_mode_invokes_rustc_test() {
     );
     let logged = fs::read_to_string(&log_file).unwrap();
     assert!(
-        logged.contains("--test"),
-        "expected --test, got: {}",
+        logged.contains("nextest"),
+        "expected cargo nextest dispatch, got: {}",
         logged
     );
     assert!(
-        logged.contains("tests/foo.rs"),
-        "expected file path, got: {}",
+        logged.contains("--test foo"),
+        "expected --test foo (basename binary filter), got: {}",
+        logged
+    );
+    assert!(
+        logged.contains("binary(foo)"),
+        "expected nextest binary expression binary(foo), got: {}",
         logged
     );
 }

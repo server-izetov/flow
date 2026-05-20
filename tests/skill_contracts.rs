@@ -6451,9 +6451,9 @@ fn flow_plan_skill_invokes_plan_review_with_capped_loop() {
     let transform_idx = c.find("### Transform + Draft").expect(
         "`### Transform + Draft` subsection must exist as the Plan Review's upstream anchor",
     );
-    let review_idx = c
-        .find("### Plan Review")
-        .expect("`### Plan Review` subsection must exist between Transform + Draft and Validate the Body");
+    let review_idx = c.find("### Plan Review").expect(
+        "`### Plan Review` subsection must exist between Transform + Draft and Validate the Body",
+    );
     let validate_idx = c.find("### Validate the Body").expect(
         "`### Validate the Body` subsection must exist as the Plan Review's downstream anchor",
     );
