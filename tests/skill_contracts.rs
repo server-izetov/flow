@@ -5387,13 +5387,15 @@ fn flow_reset_invokes_bin_flow_reset_dispatcher() {
 
 // --- assess-issues rule content contracts ---
 //
-// `.claude/rules/assess-issues.md` is the rule the issue-triage agent
-// depends on. The three contracts below lock in (a) the canonical
-// "code actually does" phrasing against the historical `issue actually
-// does` typo shape, (b) the unreferenced-files coverage bullet, and
-// (c) the `gh pr list --search` / `git log --grep` shipped-but-not-
-// closed investigation move. Each test guards a distinct regression:
-// a deletion of any of the three lines fails CI immediately.
+// `.claude/rules/assess-issues.md` is the rule the flow-triage-issue
+// skill cites in its inlined Process (Step 4 referenced-code read,
+// Step 5 already-shipped-work check). The three contracts below lock
+// in (a) the canonical "code actually does" phrasing against the
+// historical `issue actually does` typo shape, (b) the
+// unreferenced-files coverage bullet, and (c) the
+// `gh pr list --search` / `git log --grep` shipped-but-not-closed
+// investigation move. Each test guards a distinct regression: a
+// deletion of any of the three lines fails CI immediately.
 
 fn read_assess_issues_rule() -> String {
     let path = common::repo_root()
@@ -5446,15 +5448,17 @@ fn test_assess_issues_rule_includes_pr_search_step() {
 
 // --- flow-triage-issue skill content contracts ---
 //
-// `skills/flow-triage-issue/SKILL.md` is a thin dispatcher. The three
-// contracts below lock in (a) the no-side-effects HARD-GATE that
-// forbids auto-close, auto-label, auto-comment, and auto-skill
-// invocation; (b) the canonical 4-disposition closed set; and (c) the
-// dispatch target — the issue-triage sub-agent, never general-purpose
-// or any other agent. Each test guards a distinct regression: a
+// `skills/flow-triage-issue/SKILL.md` inlines the triage Process
+// directly (no sub-agent dispatch). The contracts below lock in (a)
+// the no-side-effects HARD-GATE that forbids auto-close, auto-label,
+// auto-comment, and auto-skill invocation; (b) the canonical
+// 2-disposition closed set; and (c) the prohibition on routing
+// through `general-purpose` (the inlined Process invokes no
+// sub-agent at all). Each test guards a distinct regression: a
 // missing HARD-GATE invites side-effect creep, a drifted disposition
-// set invents new outcomes the agent never produces, and a wrong
-// dispatch target sends the model into an unbounded sub-agent.
+// set invents new outcomes the inlined Process never produces, and a
+// general-purpose route would defeat tool restrictions during active
+// flows.
 
 /// Extract the body of the FIRST `<HARD-GATE>...</HARD-GATE>` block
 /// in the SKILL.md so contract assertions about HARD-GATE content
@@ -5471,6 +5475,31 @@ fn extract_hard_gate_block(content: &str) -> String {
         .find("</HARD-GATE>")
         .expect("skills/flow-triage-issue/SKILL.md must contain </HARD-GATE> closing tag");
     content[after_open..after_open + close_offset].to_string()
+}
+
+/// Extract the body of the Step 7 `#### Disposition Semantics`
+/// subsection so contract assertions about the inlined disposition
+/// list can be bound to that scope. The subsection runs from its
+/// heading to the next `####` or `###` heading (whichever comes
+/// first). Asserts the heading exists. Returns the slice between
+/// the heading and the next sibling-or-higher heading.
+fn extract_disposition_semantics_subsection(content: &str) -> String {
+    const HEADING: &str = "#### Disposition Semantics";
+    let after_heading = content.split_once(HEADING).map(|(_, tail)| tail).expect(
+        "skills/flow-triage-issue/SKILL.md must contain `#### Disposition Semantics` subsection",
+    );
+    let end_next_h4 = after_heading.find("\n#### ");
+    let end_next_h3 = after_heading.find("\n### ");
+    let end = match (end_next_h4, end_next_h3) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+    match end {
+        Some(e) => after_heading[..e].to_string(),
+        None => after_heading.to_string(),
+    }
 }
 
 #[test]
@@ -5512,30 +5541,41 @@ fn test_flow_triage_issue_skill_disposition_set_is_canonical() {
             "skills/flow-triage-issue/SKILL.md must enumerate disposition: {disposition}"
         );
     }
-    // Closed-set check: extract every quoted token inside
-    // backticks that follows a `**` disposition-marker pattern in
-    // the Step 5 hint section. The Step 5 hint enumerates one
-    // bullet per allowed disposition (`**close**`, `**decompose**`,
-    // `**Out of scope**`). Any additional `**<token>**` bullet
-    // inside the HARD-GATE disposition list is an unsanctioned
-    // extension. Locks the closed set to two canonical dispositions
-    // plus the out-of-scope envelope label.
-    let gate = extract_hard_gate_block(&content);
+    // Closed-set check: extract every `- **<token>**` bullet inside
+    // BOTH disposition-bearing scopes. The inlined SKILL.md now
+    // carries two disposition lists:
+    //   1. The HARD-GATE Step 9 disposition-hint bullets
+    //      (`**close**`, `**decompose**`, `**Out of scope**`)
+    //   2. The Step 7 `#### Disposition Semantics` subsection bullets
+    //      (`**close**`, `**decompose**`) which document the closed set
+    // Any additional `**<token>**` bullet in either scope is an
+    // unsanctioned extension. Locking both ensures a future PR
+    // adding a `**defer**` (or any other disposition) to Step 7's
+    // Disposition Semantics cannot drift independently of the
+    // HARD-GATE bullets.
     let bullet_re = regex::Regex::new(r"(?m)^- \*\*([a-zA-Z][a-zA-Z0-9 -]*)\*\*")
         .expect("disposition bullet regex");
-    let mut bullet_tokens: Vec<String> = bullet_re
-        .captures_iter(&gate)
-        .map(|cap| cap[1].trim().to_lowercase())
-        .collect();
-    bullet_tokens.sort();
-    bullet_tokens.dedup();
     let allowed: std::collections::HashSet<&str> =
         ["close", "decompose", "out of scope"].into_iter().collect();
-    for token in &bullet_tokens {
-        assert!(
-            allowed.contains(token.as_str()),
-            "skills/flow-triage-issue/SKILL.md HARD-GATE enumerates unsanctioned disposition bullet: {token:?}. The closed set is exactly {{close, decompose}} plus the Out-of-scope envelope."
-        );
+
+    let gate = extract_hard_gate_block(&content);
+    let semantics = extract_disposition_semantics_subsection(&content);
+    for (scope_name, scope_body) in [
+        ("HARD-GATE", gate.as_str()),
+        ("Step 7 Disposition Semantics", semantics.as_str()),
+    ] {
+        let mut bullet_tokens: Vec<String> = bullet_re
+            .captures_iter(scope_body)
+            .map(|cap| cap[1].trim().to_lowercase())
+            .collect();
+        bullet_tokens.sort();
+        bullet_tokens.dedup();
+        for token in &bullet_tokens {
+            assert!(
+                allowed.contains(token.as_str()),
+                "skills/flow-triage-issue/SKILL.md {scope_name} enumerates unsanctioned disposition bullet: {token:?}. The closed set is exactly {{close, decompose}} plus the Out-of-scope envelope."
+            );
+        }
     }
     // Defense in depth: forbid common alternative tokens
     // anywhere outside fenced code blocks. Use word-boundary
@@ -5557,45 +5597,33 @@ fn test_flow_triage_issue_skill_disposition_set_is_canonical() {
 }
 
 #[test]
-fn test_flow_triage_issue_skill_dispatches_issue_triage_agent() {
+fn test_flow_triage_issue_skill_does_not_dispatch_sub_agent() {
     let content = common::read_skill("flow-triage-issue");
-    // The skill MUST dispatch issue-triage in its Step 2 dispatch
-    // instruction. Bind the check to the dispatch-instruction
-    // context (the line containing "Invoke the" + "sub-agent")
-    // so prose mentions of `issue-triage` elsewhere in the file
-    // cannot satisfy the assertion (per reviewer finding R3 and
-    // adversarial test verification).
-    let dispatch_line_present = content
-        .lines()
-        .any(|line| line.contains("issue-triage") && line.contains("sub-agent"));
-    assert!(
-        dispatch_line_present,
-        "skills/flow-triage-issue/SKILL.md must contain a dispatch instruction line that names the `issue-triage` sub-agent (e.g. 'Invoke the `issue-triage` sub-agent ...')"
-    );
-    // The skill must NOT route through general-purpose — that agent
-    // ignores tool restrictions in its prompt and is forbidden during
-    // active flows by .claude/rules/skill-authoring.md "Sub-Agent Safety".
+    // The skill inlines the triage Process and invokes no sub-agent.
+    // Two assertions guard the no-dispatch invariant:
+    //
+    // 1. The general-purpose escape hatch is forbidden directly.
+    //    Per .claude/rules/skill-authoring.md "Sub-Agent Safety",
+    //    general-purpose agents ignore tool restrictions and are
+    //    forbidden during active flows.
+    // 2. Any `subagent_type:` field in the skill content signals an
+    //    Agent tool dispatch instruction. A future regression that
+    //    re-introduces sub-agent dispatch under any name (e.g.
+    //    `subagent_type: "flow:issue-triage"`, `flow:pm`,
+    //    `flow:reviewer`) must fail this test.
     assert!(
         !content.contains("general-purpose"),
         "skills/flow-triage-issue/SKILL.md must NOT use general-purpose sub-agent"
     );
-}
-
-#[test]
-fn issue_triage_agent_declares_end_of_findings_marker() {
-    // Per .claude/rules/cognitive-isolation.md "Completion-marker
-    // contract": every high-investigation agent must declare
-    // `## END-OF-FINDINGS` as the final structural element of its
-    // Output Format. Adversarial findings A7/A11/A14 demonstrated
-    // that the SKILL.md's `### Verdict` substring check is gameable
-    // by echoed instruction templates; the END-OF-FINDINGS marker
-    // is the canonical truncation signal.
-    let path = common::repo_root().join("agents").join("issue-triage.md");
-    let content = std::fs::read_to_string(&path).expect("agents/issue-triage.md must exist");
-    assert!(
-        content.contains("## END-OF-FINDINGS"),
-        "agents/issue-triage.md must declare the literal `## END-OF-FINDINGS` completion marker"
-    );
+    let dispatch_re =
+        regex::Regex::new(r"subagent_type\s*[:=]\s*").expect("subagent_type regex must compile");
+    if let Some(m) = dispatch_re.find(&content) {
+        panic!(
+            "skills/flow-triage-issue/SKILL.md must NOT dispatch any sub-agent — found `{}` at byte offset {}; the triage Process is inlined as Steps 3-7 with no Agent tool invocation",
+            m.as_str(),
+            m.start()
+        );
+    }
 }
 
 #[test]
