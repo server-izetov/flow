@@ -151,6 +151,59 @@ splitting infinitely. The user decides whether to accept partial
 coverage or rerun Review against a smaller subset of the
 diff.
 
+### Retry-prompt path-scoping constraint
+
+Every retry prompt — partitioned re-invocation OR re-invocation
+after marker-absent detection — MUST scope every path it names
+to the active worktree. Out-of-worktree paths in an agent's
+`prompt` field would otherwise reach the sub-agent's Read tool
+and surface a Claude Code permission prompt mid-autonomous-flow,
+defeating the autonomous-mode contract.
+
+The constraint is enforced by two mechanical layers in addition
+to the SKILL.md HARD-GATE in `skills/flow-review/SKILL.md` Step 2:
+
+- **Parent-side prompt scan** in
+  `src/hooks/validate_pretool.rs::run()` wired into the Agent
+  tool branch. The scan calls
+  `src/hooks/agent_prompt_scan.rs::validate_agent_prompt` on the
+  `prompt` field; the helper extracts path-shape substrings,
+  validates them, joins relative candidates onto
+  `worktree_root`, lexically normalizes the result, and rejects
+  any candidate that does not start with `worktree_root`. Blocks
+  with exit 2 and a structured message naming the offending path
+  and the worktree. This is the layer that prevents the
+  permission-prompt scenario above: the out-of-worktree path
+  never reaches the sub-agent's prompt, so the sub-agent never
+  Reads it.
+- **Autonomous-flow-strict response shape** in
+  `src/hooks/validate_worktree_paths.rs::validate()` at the
+  existing out-of-worktree block path. When the flow is
+  configured for autonomous execution (per
+  `crate::flow_paths::is_autonomous_flow_active`), the hook
+  returns a structured JSON envelope keyed on
+  `out_of_worktree_in_autonomous` instead of the
+  human-readable BLOCKED message. Both forms are exit-2 blocks
+  fed back as a tool rejection (the block itself is identical);
+  the `reason` field lets the autonomous flow classify the
+  rejection programmatically rather than scraping the prose
+  message, and serves as the stable detection anchor for a
+  future system-initiated-prompt carve-out.
+
+Residual gap: paths outside `project_root` (`~/.config`, `/tmp`,
+`.venv` outside the worktree) remain in Claude Code's built-in
+permission jurisdiction at this hook layer. Closing the gap
+entirely requires either a Claude Code feature or a project
+`settings.json` allow-list extension. The retry-prompt
+HARD-GATE is the upstream defense — drop the requirement from
+the prompt rather than redirecting toward a different
+out-of-worktree path.
+
+When in doubt, drop the path from the retry prompt entirely.
+The agent's investigation can succeed by reading in-worktree
+files alone; out-of-worktree references are almost always
+incidental to the actual review task.
+
 ## Never Supplement Agent Work From the Parent Session
 
 When an agent malfunctions — truncates, hallucinates a constraint,

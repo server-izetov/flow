@@ -354,6 +354,50 @@ pub fn validate(file_path: &str, cwd: &str) -> (bool, String) {
     let relative = &file_path[project_root.len() + 1..];
     let corrected = format!("{}/{}", worktree_root, relative);
 
+    // Issue #1704 branch C: autonomous-flow-strict response shape.
+    // Both forms below are exit-2 blocks fed back to the model as a
+    // tool rejection; the block itself is identical. The difference
+    // is the message shape: when the active flow is configured for
+    // autonomous execution, emit a structured JSON envelope whose
+    // `reason` field (`out_of_worktree_in_autonomous`) lets the
+    // autonomous flow classify the rejection programmatically rather
+    // than scraping the human-readable prose. The `reason` field is
+    // the stable detection anchor for any future
+    // system-initiated-prompt carve-out (the other block returns in
+    // this hook use a `BLOCKED:` prose prefix). Default
+    // (non-autonomous-flow) behavior unchanged.
+    //
+    // Residual gap: this branch fires ONLY when the path is inside
+    // `project_root` but outside the worktree (the existing block
+    // path). Paths outside `project_root` (~/.config, /tmp, etc.)
+    // are allowed by validate() earlier and stay outside this
+    // hook's jurisdiction — see the `paths outside the project are
+    // always fine` branch above and the residual-gap negative test.
+    //
+    // `validate_claude_paths.rs` is deliberately NOT extended here
+    // per the plan's Mirror-Pattern Audit — its fail-closed
+    // posture and protected-path scope differ from this hook.
+    // `worktree_root` is the canonical `<main_root>/.worktrees/<branch>/`
+    // path resolved upstream by `compute_worktree_root`. The basename
+    // (`file_name`) of that path is the branch — derived structurally
+    // from the worktree layout, not from a state-derived string. A
+    // detached HEAD or invalid branch makes `worktree_root` empty,
+    // in which case `is_autonomous_flow_active` receives `None` and
+    // returns false (fail-open).
+    let branch = Path::new(worktree_root)
+        .file_name()
+        .and_then(|n| n.to_str());
+    if crate::flow_paths::is_autonomous_flow_active(Path::new(project_root), branch) {
+        let envelope = serde_json::json!({
+            "status": "error",
+            "reason": "out_of_worktree_in_autonomous",
+            "blocked_path": file_path,
+            "worktree": worktree_root,
+            "autonomous": true,
+        });
+        return (false, envelope.to_string());
+    }
+
     (
         false,
         format!(
