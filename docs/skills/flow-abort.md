@@ -61,7 +61,7 @@ already closed, worktree already removed), it continues to the next.
 
 | | `/flow-complete` | `/flow-abort` |
 |---|---|---|
-| **When** | After Learn (Phase 5) | Any phase |
+| **When** | After Learn (Phase 5: Complete) | Any phase |
 | **PR** | Squash-merged into main | Closed |
 | **Remote branch** | Auto-deleted by GitHub | Deleted (via cleanup) |
 | **Worktree** | Removed | Removed |

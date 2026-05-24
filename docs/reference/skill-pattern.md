@@ -15,7 +15,7 @@ when building new phase skills.
 
 All skill directories must use the `flow-` prefix: `skills/flow-<name>/`.
 This ensures consistent invocation as `/flow:flow-<name>` across the
-entire plugin namespace. `test_structural.py` enforces this convention —
+entire plugin namespace. `tests/structural.rs` enforces this convention —
 CI will fail if a skill directory does not start with `flow-`.
 
 ---
@@ -79,23 +79,17 @@ CI will fail if a skill directory does not start with `flow-`.
 bin/flow phase-enter --phase <name> --steps-total <n>
 ```
 
-**On phase entry (Plan, Complete — legacy pattern):**
-
-```bash
-bin/flow phase-transition --phase <name> --action enter
-```
-
 **On phase exit (Start, Code, Review, Learn):**
 
 ```bash
 bin/flow phase-finalize --phase <name> --branch <branch> --thread-ts <ts>
 ```
 
-**On phase exit (Plan, Complete — legacy pattern):**
+**On phase exit (Complete):**
 
-```bash
-bin/flow phase-transition --phase <name> --action complete
-```
+Complete does not call `phase-finalize` directly — its consolidated
+`complete-finalize` subcommand runs `phase_complete()` internally as
+part of post-merge cleanup. See `docs/phases/phase-5-complete.md`.
 
 These commands handle all timing, counters, and status fields. Skills
 must never compute timestamps, time differences, or counter increments

@@ -52,9 +52,9 @@ Architecture checks and testing conventions are defined by the project's CLAUDE.
 
 During the TDD cycle, run the specific file for fast feedback:
 
-The targeted test command is `bin/flow ci --test --file <path>`, which forwards `--file <path>` to the project's `bin/test` script. For language-agnostic dispatch, see `Repo-Local Tool Delegation` in the project CLAUDE.md.
+The targeted test command is `bin/test --file <path>` (the project's own `bin/test` script — typically a thin wrapper over the language test runner). For language-agnostic dispatch, see `Repo-Local Tool Delegation` in the project CLAUDE.md.
 
-`bin/flow ci` only runs when the task is done and the diff is approved.
+`bin/flow ci` runs at commit time via `/flow-commit`'s internal `finalize-commit` gate, not during the TDD loop. During the Code phase, `validate-pretool`'s Layer 11 redirects manual `bin/flow ci` invocations to the per-file gate above; the single carve-out is `bin/flow ci --clean` for phantom-misses recovery.
 
 ---
 

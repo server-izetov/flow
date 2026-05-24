@@ -6,9 +6,9 @@ parent: Reference
 
 # Interactive TUI
 
-A standalone curses-based terminal application for viewing and managing
-active FLOW features. Runs directly in your terminal without a Claude
-session.
+A standalone Rust terminal application (built on `ratatui` + `crossterm`)
+for viewing and managing active FLOW features. Runs directly in your
+terminal without a Claude session.
 
 ## Usage
 
@@ -56,7 +56,7 @@ All data is local — no network calls:
 
 | Data | Source |
 |------|--------|
-| Active flows | `.flow-states/*.json` |
+| Active flows | `.flow-states/<branch>/state.json` |
 | Phase timeline | `state["phases"]` dict |
 | Elapsed time | `state["started_at"]` |
 | Code progress | `state["code_task"]`, `state["diff_stats"]` |
@@ -77,6 +77,5 @@ the worktree, and delete the state file.
 
 ## Platform Support
 
-macOS and Linux only. The `curses` module is part of the Python standard
-library on these platforms. Windows requires `windows-curses` (not
-supported).
+macOS and Linux only. The TUI uses Rust's `crossterm` backend; Windows
+is not supported.

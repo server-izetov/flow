@@ -21,7 +21,7 @@ Four sections render in every project:
 - **Planning** — issues, triage, create, decompose, orchestrate.
 - **Work** — start, config, skills.
 - **Health** — doc-sync, hygiene.
-- **Admin** — prime, abort, reset (user-only — type the slash command directly).
+- **Admin** — prime, abort, continue, reset (user-only — type the slash command directly).
 
 Two additional sections render only when the current repo is the FLOW plugin source (detected via `git remote get-url origin` matching `benkruger/flow`):
 

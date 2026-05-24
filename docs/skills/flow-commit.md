@@ -57,7 +57,7 @@ Subject starts with an imperative verb — Add, Fix, Update, Remove, Refactor. I
 
 CI is enforced inside `finalize-commit` itself — every commit path runs CI mechanically before `git commit`. When the CI sentinel is fresh (CI already passed for the current tree state), the check noops instantly. There is no separate CI step in the commit skill.
 
-The banner is versioned (`FLOW v1.1.0`) when a `.flow-states/*.json` state file exists, plain (`Commit`) otherwise.
+The banner is versioned (`FLOW v<plugin-version>`) when a state file exists at `.flow-states/<branch>/state.json`, plain (`Commit`) otherwise.
 
 ---
 
