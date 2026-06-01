@@ -4,8 +4,9 @@
 //!
 //! 1. `check_in_progress_utility_skill` — when a multi-step utility
 //!    skill (`flow:flow-plan`) wrote a per-session marker at
-//!    `<home>/.claude/flow/utility-in-progress-<id>.json` AND
-//!    `decompose:decompose` is the most recent Skill `tool_use` in
+//!    `<home>/.claude/flow/utility-in-progress-<id>.json` AND the
+//!    decompose skill (bare `decompose` or namespaced
+//!    `decompose:decompose`) is the most recent Skill `tool_use` in
 //!    the persisted transcript since the most recent real user
 //!    turn, refuses turn-end so the model continues from
 //!    decompose's return straight to filing.
@@ -400,6 +401,20 @@ fn normalize_gate_input(s: &str) -> String {
     s.replace('\0', "").trim().to_ascii_lowercase()
 }
 
+/// True when `s` names the decompose skill in either of its two valid
+/// invocation forms — bare `decompose` or fully-qualified
+/// `decompose:decompose`. The Skill tool records `input.skill`
+/// verbatim and both forms appear in real transcripts, so the
+/// discriminator in `check_in_progress_utility_skill` must accept
+/// both. Input is normalized via `normalize_gate_input` (NUL strip,
+/// trim, ASCII-lowercase) per `.claude/rules/security-gates.md`
+/// "Normalize Before Comparing" so a whitespace- or case-variant
+/// value still matches.
+fn is_decompose_skill(s: &str) -> bool {
+    let n = normalize_gate_input(s);
+    n == "decompose" || n == "decompose:decompose"
+}
+
 /// Unified autonomous-mode Stop gate. Three rules govern the Stop
 /// event during an in-progress autonomous phase:
 ///
@@ -613,18 +628,21 @@ pub fn check_autonomous_stop(
 }
 
 /// Refuse a voluntary turn-end when a multi-step utility skill's
-/// `decompose:decompose` sub-skill has just returned in the current
-/// model turn.
+/// decompose sub-skill (bare `decompose` or namespaced
+/// `decompose:decompose`) has just returned in the current model
+/// turn.
 ///
-/// Multi-step utility skills (`flow:flow-plan`) invoke
-/// `decompose:decompose` via the Skill tool mid-pipeline. The
+/// Multi-step utility skills (`flow:flow-plan`) invoke the decompose
+/// skill (`decompose` or `decompose:decompose`) via the Skill tool
+/// mid-pipeline. The
 /// Skill tool's return is a
 /// structural surface where the model treats the handoff as a
 /// natural stopping point and returns control to the user — breaking
 /// the unattended-flow contract these skills promise. This
 /// predicate's job is to catch THAT specific shape: marker present
-/// AND `decompose:decompose` is the most recent Skill call since
-/// the user typed.
+/// AND the decompose skill (bare `decompose` or namespaced
+/// `decompose:decompose`) is the most recent Skill call since the
+/// user typed.
 ///
 /// **Two-signal gate.** The block decision requires BOTH:
 ///
@@ -632,8 +650,9 @@ pub fn check_autonomous_stop(
 ///    `<home>/.claude/flow/utility-in-progress-<session_id>.json`
 ///    exists with matching skill name and session_id (precondition).
 /// 2. `crate::hooks::transcript_walker::most_recent_skill_since_user`
-///    returns `Some("decompose:decompose")` for the supplied
-///    `transcript_path` (the discriminator).
+///    returns the decompose skill — bare `decompose` or namespaced
+///    `decompose:decompose`, both recognized by `is_decompose_skill`
+///    — for the supplied `transcript_path` (the discriminator).
 ///
 /// The transcript walker discriminates "decompose just returned
 /// mid-pipeline" (block) from "model just sent a normal
@@ -664,7 +683,7 @@ pub fn check_autonomous_stop(
 ///   loop because each iteration produces a new decompose call as
 ///   the most recent Skill in the transcript.
 ///
-/// Composed into `run()` AFTER `check_continue` and BEFORE
+/// Composed FIRST in `run()`, before `check_continue` and
 /// `check_autonomous_stop`.
 ///
 /// **Block message.** When the gate fires, the context is the exact
@@ -735,17 +754,18 @@ pub fn check_in_progress_utility_skill(
         return no_block();
     }
     // Marker precondition satisfied. Now check the discriminator:
-    // the most recent Skill call since the user typed must be
-    // `decompose:decompose`. Without a transcript_path, the walker
-    // cannot run and the predicate fails-open — a normal reply must
-    // not block.
+    // the most recent Skill call since the user typed must be the
+    // decompose skill — bare `decompose` or namespaced
+    // `decompose:decompose` (both recognized by `is_decompose_skill`).
+    // Without a transcript_path, the walker cannot run and the
+    // predicate fails-open — a normal reply must not block.
     let transcript_path = match transcript_path {
         Some(p) if !p.is_empty() => Path::new(p),
         _ => return no_block(),
     };
     let most_recent =
         crate::hooks::transcript_walker::most_recent_skill_since_user(transcript_path, home);
-    if most_recent.as_deref() != Some("decompose:decompose") {
+    if !most_recent.as_deref().is_some_and(is_decompose_skill) {
         return no_block();
     }
     ContinueResult {
@@ -782,10 +802,10 @@ pub fn run() {
     };
 
     // Utility-skill marker guard: when a multi-step utility skill
-    // (`flow:flow-plan`) is in progress AND `decompose:decompose`
-    // is the most recent Skill
-    // since the user turn, refuse turn-end so the model continues
-    // past decompose's return. Composed FIRST because its block
+    // (`flow:flow-plan`) is in progress AND the decompose skill
+    // (bare `decompose` or namespaced `decompose:decompose`) is the
+    // most recent Skill since the user turn, refuse turn-end so the
+    // model continues past decompose's return. Composed FIRST because its block
     // message is the verbatim encouraging string for that specific
     // failure shape — wins over the generic autonomous-stop
     // refusal for the decompose-return boundary.
