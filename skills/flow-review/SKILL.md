@@ -608,13 +608,53 @@ re-invocation as if they had come from a single run. Each finding
 still maps to one of the six tenants for triage in Step 3.
 
 If a bounded re-invocation STILL returns an overflow marker with
-zero findings, the per-family slice was itself too large: note the
-tenant unavailable in the Step 3 triage summary and proceed. Do
-NOT fabricate the agent's findings (see the HARD-GATE at the end
-of this step) and do NOT split infinitely. The agent's launch is
-already recorded in `agents_returned` by FLOW's `PreToolUse:Agent`
-hook, so the `phase-finalize` required-agents gate is satisfied —
-only its findings are missing.
+zero findings, the per-family slice was itself too large — a single
+non-partitionable family (e.g. a one-file `src/` diff) cannot be
+sliced any smaller. Before declaring the tenant unavailable, apply
+the second recovery axis, `split-by-finding-type` (see
+`.claude/rules/cognitive-isolation.md` "Partition strategies").
+Re-invoke the documentation agent twice — split by finding-type AND
+investigation depth, so each pass runs only half the agent's
+investigation and stays under budget. BOTH passes receive
+`SUBSTANTIVE_DIFF_FILE` (the whole substantive diff, or the largest
+non-empty family slice): the diff is the bounded comparison anchor
+both halves need, so neither pass can be starved of it. Both passes
+consult CLAUDE.md and `.claude/rules/` only via Grep + ranged Read
+(the documentation agent's bounded read invariant), never whole-file
+— the prose corpus is not forbidden, only read in bounded form:
+
+- **Maintainability pass.** Produces only Maintainability (Tenant 3)
+  findings from the diff plus grep-anchored source investigation. It
+  may Grep CLAUDE.md and `.claude/rules/` (ranged) to confirm whether
+  a pattern is documented — the discriminator between a documented
+  pattern and a comprehension barrier — but it SKIPS the systematic
+  per-`DOC_PATHS:` drift comparison the drift pass owns.
+- **Drift pass.** Produces only Documentation (Tenant 6) findings by
+  checking each `DOC_PATHS:` doc against the diff, consulting CLAUDE.md
+  and `.claude/rules/` via Grep + ranged Read. It SKIPS the
+  codebase-comprehension (source-file) investigation the
+  maintainability pass owns.
+
+Both re-invocations MUST honor the path-scoping HARD-GATE in the
+Class 1 recovery below — every path named in either prompt stays
+inside `<worktree_path>/` or this flow's own `.flow-states/<branch>/`
+subtree. Combine findings from both passes as if they had come from
+a single run; each finding still maps to one of the six tenants for
+triage in Step 3. A pass that returns the `END-OF-FINDINGS` marker
+with zero findings is a legitimate empty result (both passes receive
+the diff and the bounded prose corpus, so neither is starved) — fold
+it into the combined set as "no findings for that tenant," not as a
+failure.
+
+Only after BOTH axes are exhausted — per-family slicing AND both
+split-by-finding-type passes STILL returning an overflow marker (the
+diff slice handed to a pass is itself the oversized read) — note the
+tenant unavailable in the Step 3 triage summary and proceed. Do NOT
+fabricate the agent's findings (see the HARD-GATE at the end of this
+step) and do NOT split infinitely. The agent's launch is already
+recorded in `agents_returned` by FLOW's `PreToolUse:Agent` hook, so
+the `phase-finalize` required-agents gate is satisfied — only its
+findings are missing.
 
 **Class 1 — Truncation.** For each high-investigation agent
 (reviewer, learn-analyst, documentation), check whether the

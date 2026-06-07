@@ -782,6 +782,207 @@ fn documentation_agent_greps_claude_md_rather_than_whole_read() {
     );
 }
 
+// --- documentation agent Grep-first .claude/rules/ handling (#1850) ---
+//
+// The `.claude/rules/` corpus is a second unbounded discretionary read
+// surface for the context-sparse documentation agent (CLAUDE.md being
+// the first, bounded by #1845). A whole-file read of a large rule file
+// overflows the agent's context before analysis, returning zero
+// findings with no END-OF-FINDINGS marker. The agent's
+// rules-cross-reference workflow reads must Grep `.claude/rules/` for
+// the diff-derived rule token, then ranged-Read the matches — never
+// whole-read a rule file.
+//
+// Regression: a future agent edit reintroduces a whole-file rule-file
+// read instruction and the agent overflows on a large rule file. The
+// bounded slice on `## Workflow` (per
+// `.claude/rules/testing-gotchas.md` "Subsection-Local Assertions in
+// Contract Tests") scopes both assertions to the agent's instruction
+// lines so the Input section's incidental `.claude/rules/` mentions
+// neither satisfy the positive check nor trip the negative one.
+#[test]
+fn documentation_agent_greps_rules_rather_than_whole_read() {
+    let c = common::read_agent("documentation.md");
+    let tail_at_heading = c
+        .split_once("## Workflow")
+        .map(|(_, tail)| tail.to_string())
+        .expect("documentation.md must have ## Workflow section");
+    let workflow = tail_at_heading
+        .split_once("\n## ")
+        .map(|(section, _)| section.to_string())
+        .unwrap_or(tail_at_heading);
+    // Positive: the workflow consults `.claude/rules/` via Grep.
+    assert!(
+        workflow.contains("Grep `.claude/rules/`"),
+        "documentation.md ## Workflow must Grep `.claude/rules/` (then ranged-Read the matches) so a large rule file cannot overflow the context-sparse agent on a single whole-file read (#1850)"
+    );
+    // Negative: the workflow must NOT instruct a whole-file Read of a
+    // rule file. A single literal is too narrow — a regression can
+    // reintroduce the whole-read with any natural phrasing while
+    // leaving the positive `never whole-read a rule file` invariant in
+    // place, so the denylist covers the realistic alternate phrasings
+    // (none of which is a substring of the invariant sentence). The
+    // negative is scoped to the Workflow section so the Input section's
+    // `.claude/rules/` cross-reference prose does not trip it.
+    for forbidden in [
+        "Read `.claude/rules/*.md` files",
+        "Read each rule file in full",
+        "read the whole rule file",
+        "read the entire rule file",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "documentation.md ## Workflow must not instruct a whole-file Read of a rule file (`{}`) — consult `.claude/rules/` via Grep + ranged Read instead (#1850)",
+            forbidden
+        );
+    }
+}
+
+// --- documentation agent Grep-first source investigation (#1850) ---
+//
+// Source-file investigation is the agent's fourth read surface and,
+// like the rules corpus, was unbounded: a whole-file read of a large
+// source file overflows the context-sparse agent before analysis. The
+// investigate-codebase workflow step must Grep the codebase for the
+// symbol or pattern, then ranged-Read only the matched ranges — never
+// whole-read a source file. The intentional first-pass whole-read of
+// the SUBSTANTIVE_DIFF_FILE is carved out of the invariant; the
+// negative needle below names a whole-source-read shape distinct from
+// that diff read so the carve-out is not flagged.
+//
+// Regression: a future agent edit reintroduces whole-file source reads
+// during investigation, re-opening the overflow surface. The bounded
+// slice on `## Workflow` scopes the assertions to the agent's
+// instruction lines.
+#[test]
+fn documentation_agent_greps_source_rather_than_whole_read() {
+    let c = common::read_agent("documentation.md");
+    let tail_at_heading = c
+        .split_once("## Workflow")
+        .map(|(_, tail)| tail.to_string())
+        .expect("documentation.md must have ## Workflow section");
+    let workflow = tail_at_heading
+        .split_once("\n## ")
+        .map(|(section, _)| section.to_string())
+        .unwrap_or(tail_at_heading);
+    // Positive: the investigate-codebase step greps the codebase and
+    // states the ranged-read invariant.
+    assert!(
+        workflow.contains("Grep the codebase"),
+        "documentation.md ## Workflow must Grep the codebase (then ranged-Read the matches) so a large source file cannot overflow the context-sparse agent on a single whole-file read (#1850)"
+    );
+    assert!(
+        workflow.contains("never whole-read a source file"),
+        "documentation.md ## Workflow must state the never-whole-read-a-source-file invariant so investigation reads stay ranged (#1850)"
+    );
+    // Negative: the workflow must NOT instruct a whole-file Read of a
+    // source file during investigation. A single literal is too narrow
+    // — a regression can reintroduce the whole-read with any natural
+    // phrasing while leaving the positive `never whole-read a source
+    // file` invariant in place, so the denylist covers the realistic
+    // alternate phrasings (none of which is a substring of the
+    // invariant sentence). All are distinct from the intentional
+    // `Read the SUBSTANTIVE_DIFF_FILE` first-pass read, so the carve-out
+    // is not flagged.
+    for forbidden in [
+        "Read the full source file",
+        "Read the whole source file",
+        "read the entire source file",
+        "read the source file in full",
+    ] {
+        assert!(
+            !workflow.contains(forbidden),
+            "documentation.md ## Workflow must not instruct a whole-file Read of a source file during investigation (`{}`) — Grep + ranged Read instead (#1850)",
+            forbidden
+        );
+    }
+}
+
+// --- flow-review Class 0 split-by-finding-type recovery axis (#1850) ---
+//
+// When per-family diff slicing still overflows the documentation
+// agent's context, Class 0 must fall back to a second recovery axis —
+// split-by-finding-type — re-invoking the agent as a maintainability
+// pass (diff + grep-anchored source investigation) and a
+// documentation-drift pass (diff + per-DOC_PATHS comparison) before
+// declaring the tenant unavailable. Without the second axis, a
+// non-partitionable single-family diff loops straight to "tenant
+// unavailable" and the documentation tenant is silently skipped.
+//
+// Two correctness invariants the prose must encode (both Review
+// findings on the original axis): BOTH passes must receive
+// `SUBSTANTIVE_DIFF_FILE` — the diff is the comparison anchor a drift
+// pass cannot work without — and neither pass may FORBID the
+// CLAUDE.md / `.claude/rules/` reads, which are already bounded by the
+// agent's grep+ranged invariant; the maintainability pass must be
+// allowed to Grep them to confirm whether a pattern is documented
+// (the discriminator that decides whether something is a comprehension
+// barrier). A pass that omitted the diff, or that forbade the prose
+// corpus its finding criterion depends on, would return starved
+// marker-present-but-empty results.
+//
+// Regression: a future skill edit drops the second axis, or reverts to
+// a drift pass with no diff / a maintainability pass that forbids the
+// prose corpus. The bounded slice on the Class 0 subsection (per
+// `.claude/rules/testing-gotchas.md` "Subsection-Local Assertions in
+// Contract Tests") scopes the assertions to the Class 0 recovery prose
+// — the boundary markers are the section headers, because the bare
+// token `Class 1` recurs inside the Class 0 body.
+#[test]
+fn flow_review_class0_has_split_by_finding_type_axis() {
+    let c = common::read_skill("flow-review");
+    let tail = c
+        .split_once("**Class 0 — Read overflow.**")
+        .map(|(_, t)| t.to_string())
+        .expect("flow-review SKILL.md must have a Class 0 — Read overflow subsection");
+    let subsection = tail
+        .split_once("**Class 1 — Truncation.**")
+        .map(|(s, _)| s.to_string())
+        .unwrap_or(tail);
+    // Positive: the second recovery axis is named, its two passes are
+    // described, BOTH passes get the diff anchor, and the prose corpus
+    // is read in bounded form (not forbidden).
+    for needle in [
+        "split-by-finding-type",
+        "Maintainability pass",
+        "Drift pass",
+        "DOC_PATHS",
+        // BOTH passes receive the diff anchor — the drift pass cannot
+        // detect PR-introduced drift without it.
+        "the diff is the bounded comparison anchor",
+        // The maintainability pass may consult the (now-bounded) prose
+        // corpus to confirm documentation, rather than being forbidden
+        // from reading it.
+        "may Grep CLAUDE.md",
+    ] {
+        assert!(
+            subsection.contains(needle),
+            "flow-review Class 0 subsection must name the split-by-finding-type recovery axis with both-passes-get-the-diff and bounded prose-corpus reads — missing `{}` (#1850)",
+            needle
+        );
+    }
+    // Negative: the passes must NOT forbid the CLAUDE.md / rules reads
+    // entirely — that contradicts the maintainability finding criterion
+    // and the agent's grep+ranged invariant.
+    assert!(
+        !subsection.contains("skip CLAUDE.md and `.claude/rules/` reads"),
+        "flow-review Class 0 passes must not forbid CLAUDE.md / `.claude/rules/` reads entirely — they are bounded by the grep+ranged invariant and the maintainability pass needs them to confirm documentation (#1850)"
+    );
+    // Ordering: the split-by-finding-type fallback appears BEFORE the
+    // terminal that declares the tenant unavailable, so a
+    // non-partitionable diff tries the second axis before giving up.
+    let axis_idx = subsection
+        .find("split-by-finding-type")
+        .expect("axis name present (checked above)");
+    let terminal_idx = subsection
+        .find("tenant unavailable in the Step 3 triage")
+        .expect("Class 0 must retain the tenant-unavailable terminal");
+    assert!(
+        axis_idx < terminal_idx,
+        "flow-review Class 0 split-by-finding-type axis must appear before the tenant-unavailable terminal (#1850)"
+    );
+}
+
 // --- flow-hygiene CLAUDE.md mandate and size-budget contracts ---
 //
 // The flow-hygiene skill scans project-local rules for paraphrased
