@@ -184,12 +184,16 @@ refreshed in the working tree with the executable bit set, so the
 git add -A
 ```
 
-Staging must happen before writing `.flow-commit-msg` in Step 8 — otherwise
-`git add -A` picks up the message file and commits it into the repo.
-
 ## Step 8 — Write commit message and finalize
 
 Write `Release v<new_version>` to `.flow-commit-msg` via the Write tool.
+Step 7's `git add -A` ran before this write, so it never staged the
+message file, and `finalize-commit`'s internal re-stage uses `git add -u`
+(tracked files only), which skips the untracked `.flow-commit-msg` — that
+stage-before-write ordering is what keeps it out of the commit.
+`EXCLUDE_ENTRIES` additionally hides it from `git status` once the project
+re-primes, and `finalize-commit` deletes it on every exit so a stale file
+never pre-exists a retry.
 
 Then finalize the commit in one call. `finalize-commit` runs
 `ci::run_impl()` before `git commit` (see CLAUDE.md "CI is enforced
@@ -199,7 +203,7 @@ default 2-minute timeout would background the process, defeating
 the gate (per `.claude/rules/ci-is-a-gate.md`).
 
 ```bash
-bin/flow finalize-commit .flow-commit-msg main
+bin/flow finalize-commit main
 ```
 
 No diff review. No `bin/ci`. No approval prompt — CI was verified in
