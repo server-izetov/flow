@@ -4872,25 +4872,12 @@ fn extract_helper_refactor_rule_has_expected_structure() {
          'extract-helper-refactor: not-an-extraction'"
     );
 
-    // The rule file must carry the canonical section structure the
-    // SKILL.md cross-reference promises. A future edit that removes
-    // Why, The Rule, The Three Classifications, or Enforcement
-    // leaves the rule without its substantive scaffolding; these
-    // assertions fail CI on that regression.
-    for section in [
-        "## Vocabulary",
-        "## Why",
-        "## The Rule",
-        "## The Three Classifications",
-        "## Enforcement",
-        "## Opt-Out Grammar",
-        "## How to Apply",
-    ] {
-        assert!(
-            content.contains(section),
-            "extract-helper-refactor.md must contain section heading: {section}"
-        );
-    }
+    // Per `.claude/rules/rule-authoring.md`, rule files are terse —
+    // directive + trigger, no narrative section scaffolding. The
+    // behavioral tokens (the three classifications, the opt-out token,
+    // the Branch Enumeration Table header) are what this contract pins;
+    // the prior `## Why`/`## How to Apply`/etc. heading requirements
+    // were dropped when the corpus was made terse.
 
     // The canonical four-column Branch Enumeration Table must appear
     // in the rule file as the reference for Plan authors.

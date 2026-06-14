@@ -1,55 +1,14 @@
 # Anti-Patterns
 
-## Inline Output
-
-When a phase produces output the user needs to review (plan file,
-DAG analysis, review findings), render the full content inline in
-the response text. Never tell the user to "look at" a file path
-or "take a look" at a location — the user cannot see file contents
-unless they are rendered in the response. The Read tool output
-appears in tool results, but users expect the content presented as
-formatted text in the response itself.
-
-## Fix Before Remove
-
-When a feature is broken, the first response must be to fix it —
-not to remove it. Proposing removal as the initial approach
-discards the user's intent. Only propose removal after demonstrating
-that the feature cannot be fixed or after the user explicitly asks
-for it.
-
-## Never Offer to Skip Workflow Steps
-
-When a hook blocks an action or the user is frustrated with a
-workflow step, never offer to skip the step as an option. Every
-step in the lifecycle exists for a reason — offering to skip it
-signals that the step is optional, which undermines the process.
-Fix the blocked action and retry. If the action cannot be fixed,
-report why and wait for direction.
-
-This applies especially to review steps (Simplify, Review,
-Security, Agent Reviews) where skipping silently weakens the
-quality gate.
-
-## Imprecise Rule-File Mechanism Descriptions
-
-When a rule file's Enforcement section describes what a hook or
-validator matches, use the precise mechanism — not hand-wavy
-language. "Starting with X" implies prefix matching on the raw
-string; "ending with X" implies suffix matching; "containing X"
-implies substring matching; "first token is X" implies whitespace
-tokenization. A mismatch between the rule prose and the code's
-matching logic misleads future readers trying to predict hook
-behavior without reading the source.
-
-When a rule references project-specific vocabulary ("FLOW phase",
-"phase gate", "state file"), either define the term parenthetically
-on first use or cite the file that defines it (e.g. "see
-`docs/reference/flow-state-schema.md`"). A rule file must stand
-alone for a reader who has not yet memorized the project vocabulary.
-
-When a rule explains a non-obvious design choice (e.g. "the
-suffix match is intentional"), the explanation should cover
-*why* it matters — what fails without it — not just *what* the
-mechanism does. A newcomer who only sees "what" cannot judge
-whether the mechanism still serves its purpose after a refactor.
+- **Inline Output.** Render review-output (plan, DAG, findings) as
+  formatted text in the response. Never tell the user to "look at" or
+  "take a look at" a file — they cannot see file contents otherwise.
+- **Fix before remove.** When a feature is broken, fix it first. Only
+  propose removal after showing it cannot be fixed, or when the user asks.
+- **Never offer to skip workflow steps.** When a hook blocks or the user
+  is frustrated with a step, never offer skipping it. Fix the blocked
+  action and retry; if unfixable, report why and wait for direction.
+- **Precise rule-file mechanism descriptions.** In a rule's enforcement
+  prose, name the exact match mechanism — "starts with" = prefix, "ends
+  with" = suffix, "contains" = substring, "first token" = tokenization.
+  Define project vocabulary on first use or cite its defining file.

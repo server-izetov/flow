@@ -1,121 +1,21 @@
 # Subprocess Argument Escaping
 
-When a value sourced from outside the process (state file, git
-output, user config, parsed JSON, env var, CLI arg) is interpolated
-into a string that another interpreter will parse — AppleScript via
-`osascript`, shell via `bash -c`, SQL via a query string, regex,
-JSON, GitHub Markdown table cells, etc. — the value MUST be escaped
-according to that interpreter's literal-syntax rules before
+When a value from outside the process (state file, git/subprocess output, config,
+env, CLI arg) is interpolated into a string another interpreter parses —
+AppleScript (`osascript`), shell (`bash -c`), SQL, regex, JSON, GitHub Markdown
+table cells — it MUST be escaped per that interpreter's literal syntax before
 interpolation. Raw `format!` interpolation is an injection vector.
 
-## Why
+The escape helper: named after the target language (`escape_applescript_string`,
+`escape_markdown_cell` — never generic "sanitize"); doc-comment naming the
+structural characters (AppleScript: `\` and `"`; Markdown cell: `|` `\` `\n`
+`\r`); exhaustively unit-tested (empty, safe-only, structural-only, mixed,
+escape-char-itself); and the ONLY path to the interpolation site (no
+"trusted caller" bypass).
 
-State files live on disk and are writable by any process with
-filesystem access — including a future extension or a hand edit
-that produced a malformed value. Subprocess output is constrained
-by the producer but not by FLOW. CLI args accept any string a shell
-can pass.
+Preferred avoidances: pass args via `.arg()` not `bash -c`; parameterized SQL
+not `format!`; `serde_json::to_string` not hand-built JSON; `regex::escape`.
 
-A crafted value containing the target language's structural
-characters (e.g., `"` in AppleScript) closes the literal early and
-lets everything after run as code under the user's privileges.
-
-## The Rule
-
-For every interpolation of an externally sourced string into a
-language-bearing string literal, run the value through an explicit
-escape helper before `format!`. The escape helper:
-
-1. **Names the target language** in its function name —
-   `escape_applescript_string`, `escape_shell_arg`,
-   `escape_sql_literal`, `escape_markdown_cell`, etc. Generic
-   "sanitize" or "clean" helpers are a smell.
-2. **Has a doc comment that names the structural characters** for
-   that language. AppleScript's are `\` and `"`. Shell's are the
-   full operator set plus quotes. SQL's depend on the dialect.
-   GitHub Markdown table cells use `|` as the column delimiter
-   and `\n`/`\r` as the row delimiter.
-3. **Is exhaustively unit-tested** against:
-   - the empty input,
-   - input containing only safe chars,
-   - input containing only the structural char(s),
-   - input containing both safe and structural chars,
-   - input that LOOKS safe but contains the escape char itself
-     (e.g. backslash before quote in AppleScript).
-4. **Is the ONLY path** by which external values reach the
-   interpolation site. No shortcuts, no "this caller is safe."
-
-## Reference Implementation
-
-The canonical example is `escape_applescript_string` in
-`src/tui.rs`, used by `build_iterm_activation_script`. It escapes
-`\` and `"` (the only structural characters inside AppleScript
-double-quoted literals) with a leading backslash. Adversarial tests
-prove the injection substring `" then do shell script` cannot
-appear unescaped in the output for a malicious input.
-
-A sibling reference is `escape_markdown_cell` in
-`src/render_pr_body.rs`, used by `format_cost_table` to render
-session-derived model names inside the GitHub Markdown table.
-It escapes `|`, `\`, `\n`, and `\r` — preventing a model name
-with a literal pipe from injecting an extra column, and a model
-name with a newline from breaking the row onto two lines.
-
-## Where This Applies
-
-- **`osascript -e <script>`** — escape AppleScript string literals
-  before interpolation.
-- **`Command::new("sh").arg("-c").arg(<script>)`** — avoid shell
-  interpolation entirely; pass arguments via `.arg()` instead. If
-  shell interpolation is unavoidable, escape per shell-quoting
-  rules.
-- **`format!("SELECT * WHERE x = '{}'", val)`** — never. Use a
-  parameterized query.
-- **`format!("{{\"key\": \"{}\"}}", val)`** — never. Use
-  `serde_json::to_string`.
-- **Any external value reaching a regex pattern** — use
-  `regex::escape`.
-- **Any external value reaching a shell command via `bash -c`** —
-  use a quoting helper or restructure to avoid `bash -c`.
-- **`format!("| {} | {} |", name, value)` rendering to GitHub
-  Markdown** — escape `|`, `\`, `\n`, `\r` in every external
-  string interpolated into a table cell. An unescaped pipe in a
-  cell value injects an extra column delimiter and breaks the
-  table; an unescaped newline ends the table row early. The
-  reference helper is `escape_markdown_cell` in
-  `src/render_pr_body.rs`.
-
-## Plan-Phase Trigger
-
-When a plan task proposes building an interpolated string from
-external input, the plan's Risks section must enumerate:
-
-1. The **target interpreter** the string will be parsed by
-2. The **structural characters** that interpreter treats as syntax
-3. The **escape function** the implementation will call before
-   interpolation
-4. The **adversarial test** that will prove injection is impossible
-
-## How to Apply (Code Phase)
-
-1. Write the escape helper FIRST. Test it before writing the
-   interpolation site — TDD applies here even more strongly than
-   usual because the security property is non-obvious.
-2. Make the interpolation site call the escape helper with NO
-   conditional bypass. "Trusted callers" don't exist over time.
-3. Write at least one adversarial test that:
-   - Constructs a value that would inject if interpolated raw
-   - Calls the production interpolation function
-   - Asserts the injected substring does NOT appear in the output
-     in a position where the target interpreter would execute it
-
-## How to Apply (Review Phase)
-
-When the reviewer agent or adversarial agent finds an interpolation
-of external input, verify:
-
-1. The escape helper exists and is named after the target language
-2. The helper has tests covering all categories above
-3. The interpolation site uses the helper with no bypass path
-4. The helper's `format!` (or equivalent) interpolates the
-   ESCAPED value, not the raw input
+Write the escape helper + its tests FIRST, then the interpolation site. Add an
+adversarial test: a value that would inject if raw, asserting the injected
+substring cannot appear in an executable position of the output.

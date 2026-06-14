@@ -1,102 +1,26 @@
 # Forward-Facing Authoring
 
-Every persistent artifact a FLOW phase produces — rule files,
-CLAUDE.md entries, doc comments, skill instructions, plan prose,
-finding reasons — describes what IS, not what WAS. The incident
-that motivated the artifact is fixed; future readers do not need
-to reconstruct the incident to understand the guidance.
+Every persistent artifact — `.claude/rules/*.md`, `CLAUDE.md`, Rust doc
+comments, SKILL.md, plan prose, finding reasons re-read as guidance —
+describes what IS, not what WAS. The motivating incident is fixed; readers
+do not reconstruct it.
 
-## Scope
+Test before writing: "Does this make sense to a reader who never saw the
+incident that produced it?" No → rewrite to the principle/invariant; remove
+the history.
 
-Applies to:
+Prohibited: first-person narrative ("we hit this", "during PR #NNN"); "after
+the fix" framing; "was/was-not" / "previously the code did X"; citing a
+file/PR the session just touched as the anchor; principles drawn from one
+incident with no generalization; appended motivating-incident sections.
 
-- `.claude/rules/*.md`
-- `CLAUDE.md`
-- Doc comments on Rust items in `src/**/*.rs`
-- Skill instructions in `skills/**/SKILL.md` and
-  `.claude/skills/**/SKILL.md`
-- Plan prose (Context, Exploration, Risks, Approach, Tasks)
-- Finding records where the `reason` will be re-read as guidance
-  (not just as triage audit)
+Correct: name the code shape abstractly + a generic snippet; state the
+invariant/contract in present tense ("When X, do Y"); cite code only as a
+permanent canonical example.
 
-Exempt (historical by nature):
+Exempt (historical by nature): commit messages, issue bodies, session logs,
+state-file `findings[].reason` triage fields, tombstone comments.
 
-- Commit messages
-- GitHub issue bodies
-- Session logs (`.flow-states/<branch>/log`)
-- State-file `findings[]` `reason` fields that record per-PR
-  triage rationale and are not re-read as future guidance
-- Tombstone test comments (follow the `Tombstone: ... PR #<N>`
-  pattern by design — see `.claude/rules/tombstone-tests.md`)
-
-## The Test
-
-Before writing, apply the Forward-Facing Test:
-
-> "Does this make sense to a future reader who has never seen
-> the incident that produced it?"
-
-- Yes — keep.
-- No — rewrite to describe the principle, behavior, or
-  constraint. Remove the history.
-
-## Prohibited Patterns
-
-- First-person narrative: "we hit this", "I found", "during
-  PR #NNN", "in branch X"
-- "After the fix" framing: "now that X is fixed, don't…"
-- "Was/was-not" framing: "previously the code did X",
-  "until recently we…"
-- Just-merged-work citations: a specific file or PR the current
-  session just touched, used as the anchor for the principle
-- Principles derived from a single incident with no
-  generalization beyond it
-- Motivating-incident sections appended to rules — provenance
-  belongs in commit messages, not rule bodies
-
-## Correct Patterns
-
-- Name the code shape, behavior, or process abstractly, then
-  illustrate with a generic snippet
-- State the invariant, contract, or required behavior
-- Use present tense: "When X happens, do Y"
-- Cite code references only when they are permanent canonical
-  examples — a reference implementation that will outlast any
-  individual incident
-
-## How Learn Applies This
-
-Learn's audit findings are backward-facing by construction
-("during this flow, X happened"). The rule Learn writes must
-not be.
-
-Transform findings into rules by stripping the incident:
-
-- Finding (backward): "During PR #NNN, function X had an
-  unreachable branch that led the session to ship <100%."
-- Rule (forward): "When an early-return guard guarantees a
-  downstream invariant, later code must not re-check the
-  invariant via a pattern that produces an unreachable branch.
-  Use value substitution or fold into existing control flow."
-
-If the rule only makes sense when the reader knows the specific
-incident that spawned it, the finding is too
-incident-specific to codify. Record it in the commit message
-and discard — do not create a rule file.
-
-## How Review Applies This
-
-Fixes in Step 4 that add doc comments or rule updates must be
-forward-facing before commit. A rule addition or doc comment
-that names the current PR, branch, or file the session just
-modified is a Real finding that must be rewritten before Step 4
-concludes.
-
-## Cross-References
-
-- `.claude/rules/no-backwards-reasoning.md` — sibling rule
-  covering the READING side. Forward-facing authoring forbids
-  WRITING history-citing prose; no-backwards-reasoning forbids
-  consuming historical artifacts as authority on
-  should-questions. Together they close the loop on both sides
-  of historical reasoning.
+When turning a backward-facing finding into a rule, strip the incident. If
+the rule only makes sense with the incident, it is too specific — record it
+in the commit message and discard.

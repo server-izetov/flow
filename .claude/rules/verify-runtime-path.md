@@ -1,65 +1,21 @@
 # Verify the Runtime Path
 
-Before writing a fix, trace the actual execution path to confirm
-where the code runs.
+Before writing a fix, trace the actual execution path:
 
-## Required Steps
+1. Find the real call site — grep all callers; a function may be called from
+   elsewhere, or not at all if another path runs first.
+2. Verify runtime behavior — run the real chain (Claude Code → bash → bin/flow
+   → flow-rs) and print actual values. Unit-test mocks miss environment issues
+   (missing tty, wrong parent, piped stdin).
+3. Check one layer deeper — an unexpected subprocess value (`??`, empty, wrong
+   PID) is a symptom; investigate before filtering it out.
 
-1. **Find the real call site.** Grep for all callers. A function
-   may exist in one file but be called from another — or not called
-   at all if a different code path runs first.
-2. **Verify runtime behavior.** Write a small diagnostic script
-   that runs through the same call chain (Claude Code → bash →
-   bin/flow → flow-rs) and print the actual values. Unit test
-   mocks do not catch environment issues like missing ttys,
-   wrong parents, or piped stdin.
-3. **Check one layer deeper.** When a subprocess returns an
-   unexpected value (`??`, empty string, wrong PID), investigate
-   why before filtering it out. The wrong value is a symptom.
+Plan phase, when a plan adds a NEW production path — a new branch in an
+existing function, OR a new function/scanner/helper wired into multiple entry
+points — enumerate every caller/invocation site that takes the new path and,
+per row: the conditions that hit it, and the named test that exercises it with
+those inputs. Never collapse multiple callsites into "the N callsites".
 
-## Plan-phase extension for new production paths
-
-The rule above applies to fixes, but it must also apply in the Plan
-phase whenever a plan introduces a **new** execution path that a
-production caller will take. Two shapes of this class:
-
-**Shape A — new branch inside an existing function.** Adding a new
-branch (a new `if` arm, a new `match` arm, a new early-return guard)
-inside a function with a live production caller creates a path that
-never ran before — and therefore has no coverage and no proof it
-behaves as intended.
-
-**Shape B — new callsite family introduced by a feature.** Adding a
-new function, scanner, helper, or module and wiring it into multiple
-existing entry points creates multiple production paths in the same
-PR. Each invocation site is its own callsite audit row — the plan
-must list every invocation point and name the test that exercises
-it, not rely on a single "integration test" that happens to hit
-one of them.
-
-When the plan modifies a function OR introduces a new callsite
-family, the plan must enumerate the callers and, for every row:
-
-1. Record the conditions under which the caller hits the new code
-   path.
-2. Name the test that exercises the new path, using inputs that
-   drive the caller's conditions (not a contrived unit-test
-   fixture).
-3. For callsite families, list every invocation point separately —
-   never collapse multiple callsites into "the N callsites" or
-   "all the integration sites" without enumerating each one by
-   name and each one's test.
-
-## Anti-Patterns
-
-- Committing a fix without running it through the real path
-- Adding a second fix on top of an unverified first fix
-- Trusting unit tests as proof that runtime behavior is correct
-  when the bug is environmental (process tree, tty, file system)
-- Assuming which file creates/owns a piece of state without
-  grepping for all writers
-- Adding a new branch to a function without listing the production
-  callers that will take it and the tests that prove the new paths
-- Introducing a new scanner, hook, or helper family and describing
-  the integration as a count ("the three callsites") without
-  enumerating each callsite and its named test
+Forbidden: committing a fix without running the real path; stacking a second
+fix on an unverified first; trusting unit tests when the bug is environmental;
+assuming which file owns state without grepping all writers.

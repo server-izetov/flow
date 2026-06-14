@@ -1,50 +1,24 @@
 # Semi-Formal Reasoning
 
-When adding or modifying a FLOW agent, evaluate whether it should
-include a Reasoning Discipline section with the Premise → Trace →
-Conclude template.
+When adding or modifying a FLOW agent, decide whether it needs a Reasoning
+Discipline section with the Premise → Trace → Conclude template.
 
-## When to Include
+Include it when the agent produces prose findings about code behavior (bugs,
+risks, violations, coverage gaps), reasons about execution paths / data flow /
+state transitions, or makes claims that depend on runtime behavior.
 
-Include the reasoning discipline when the agent:
+Skip it when the agent produces concrete artifacts (e.g. a code generator),
+performs process/compliance analysis rather than code-semantic analysis, or
+evaluates comprehension/documentation rather than behavior.
 
-- Produces prose findings about code behavior (bugs, risks,
-  violations, coverage gaps)
-- Reasons about execution paths, data flow, or state transitions
-- Makes claims that depend on how code actually behaves at runtime
+The template, per finding:
 
-Current agents with the discipline: pre-mortem, reviewer, ci-fixer
-(deep-diagnosis mode only), adversarial.
+- **Premise** — state the claim, cite specific file paths and line ranges.
+- **Trace** — walk the execution path step by step, verifying each step with
+  Read or Grep.
+- **Conclude** — confirm or refute the premise from the trace.
 
-## When Not to Include
+Findings with incomplete traces are discarded, not reported with caveats.
 
-Skip the reasoning discipline when the agent:
-
-- Produces concrete artifacts rather than prose findings (e.g.,
-  a code generator that outputs compilable code)
-- Evaluates comprehension or documentation rather than behavior
-  (e.g., documentation agent reviewing maintainability and doc accuracy)
-
-Current agents without the discipline: documentation. The
-documentation agent evaluates comprehension barriers and
-documentation drift — neither requires execution-path tracing.
-
-## The Template
-
-Each finding follows three steps:
-
-- **Premise** — state the claim and cite specific file paths and
-  line ranges
-- **Trace** — walk the execution path step by step, verifying each
-  step with Read or Grep
-- **Conclude** — confirm or refute the premise based on the trace
-
-Findings with incomplete traces must be discarded, not reported
-with caveats.
-
-## Speed-Sensitive Agents
-
-When an agent has a speed-critical first pass (like ci-fixer),
-scope the discipline to retry attempts only. The first attempt
-uses direct diagnosis. Semi-formal reasoning activates on attempt
-2+ when the fast path has failed and deeper analysis is needed.
+For a speed-critical agent (e.g. ci-fixer), scope the discipline to retry
+attempts only: first attempt direct, semi-formal reasoning on attempt 2+.

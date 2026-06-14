@@ -1,154 +1,26 @@
 # No Waivers — 100% Coverage, No Escape Hatch
 
-All Rust code in the FLOW repo must be covered by tests. There is no
-waiver mechanism. `test_coverage.md`, `security_waivers.md`, or any
-similar per-line exception file is forbidden — neither the file itself
-nor the discipline that authorizes one.
+All Rust code must be covered. There is NO waiver mechanism: a `test_coverage.md`
+/ `security_waivers.md` per-line exception file is forbidden — the file and the
+discipline that authorizes one.
 
-## The Rule
+When a path seems unreachable from in-process tests, the only responses are:
 
-When a code path appears unreachable from in-process tests, the
-default response is one of:
+1. Add a subprocess test spawning the binary (`tests/main_dispatch.rs` pattern).
+2. Refactor for testability (the `run_impl_main(...) -> (Value, i32)` seam).
+3. Delete the branch if no production caller reaches it.
 
-1. **Add a subprocess test** that spawns the compiled binary
-   (`tests/main_dispatch.rs` is the reference) and exercises the
-   path through the real CLI surface. cargo-llvm-cov instruments
-   subprocess calls when they invoke the same binary, so the lines
-   become covered.
-2. **Refactor the code** to make it testable from in-process tests.
-   The reference pattern is the `run_impl_main(...) -> (Value, i32)`
-   seam that returns its result instead of calling
-   `process::exit` directly. Tests call the helper, assert on the
-   tuple, and the thin wrapper does the print + exit.
-3. **Change the design** so the path is not needed. If a function
-   has a defensive branch that no production caller can reach,
-   delete the branch.
+If none works, the code is wrong, not the test surface.
 
-If none of these work, the code is wrong — not the test surface.
-Find a different approach.
+Forbidden in plan prose (these ARE proposing waivers): "add a test_coverage.md
+entry…", "if any line remains uncoverable…", "waiver candidates", "record the
+achievable baseline", "accept the current measurement as the target", any
+conditional branch ending in "file a waiver".
 
-## Forbidden Plan Prose
+Measurement-only antipattern: a "verify 100%" task whose success criterion is
+"measure the TOTAL" is a waiver in disguise. The task must hard-gate phase
+completion on per-file 100% — run `bin/flow ci`, and if below 100% return to the
+test task; never "record the baseline".
 
-A plan is incomplete if any of its prose proposes a waiver entry,
-even conditionally. The following prose patterns violate this rule:
-
-- "Add a `test_coverage.md` entry for ..."
-- "If any line remains uncoverable ..."
-- "Strategy: prefer coverage over waivers" (mentions waivers as
-  even a possibility)
-- "Waiver candidates: ..."
-- "If coverage cannot be achieved ..."
-- "Record the achievable baseline"
-- "Accept the current measurement as the target"
-- Any conditional branch in plan prose where the unreachable case
-  is "file a waiver"
-
-A plan that includes any of these is not "going to consider waivers
-as a last resort" — it is *already proposing waivers*. Such a plan
-is incomplete and must be rewritten.
-
-## Measurement-Only Task Antipattern
-
-A plan task that defines its success criterion as "measure the current
-coverage TOTAL" — instead of "confirm coverage reaches 100%" — is a
-waiver dressed up as a task shape. A session that executes such a task
-will record the measurement, declare victory, and move on with coverage
-below 100%. That is a waiver.
-
-This antipattern is forbidden even when the plan also contains explicit
-iteration language elsewhere ("if below 100%, return to the relevant
-test task"). Execution agents gravitate toward the measurement task
-body, not toward the iteration clause — so the iteration clause is
-effectively a waiver escape hatch.
-
-**The rule.** A plan that includes a "verify 100%" task must hard-gate
-phase completion on the 100% result. Measurement-only outputs are not
-acceptable completion criteria for coverage-gated tasks. The task body
-must:
-
-1. Run `bin/flow ci` to capture the TOTAL.
-2. If below 100% per-file, return to the preceding test task and add
-   coverage until the target is met.
-3. Only proceed when every targeted file reads 100% per the plan's
-   acceptance criteria.
-
-A task that writes "record the achievable baseline" or "accept the
-current measurement as the achievable target" violates this rule.
-
-**When authoring the plan.** When a plan's acceptance criteria state
-"all N files reach 100%" but the plan's tasks only verify the
-aggregate TOTAL without per-file iteration, the plan is incomplete.
-The plan author must either strengthen the verification task to
-hard-gate on per-file 100% or revise the acceptance criteria to
-match what the tasks actually produce.
-
-## Why
-
-The waiver path is a slippery slope. Once a plan proposes a waiver
-"only as a fallback," the Code phase will exercise the fallback
-because some uncovered lines are always inconvenient to reach. The
-inconvenient lines accumulate as waivers, the waiver inventory
-grows, and the actual test surface shrinks. The cost of the "no
-waivers, ever" rule is forcing the harder solution upfront. The
-benefit is that every line is exercised and a future refactor can
-trust the test suite to catch regressions across the entire surface.
-
-## Enforcement
-
-This rule is the project's gate against waiver drift. It is
-enforced at three layers:
-
-1. **Rule prose** (this file). The first instrument is the rule
-   itself — every plan author must read this file when designing
-   coverage strategy.
-2. **Review reviewer agent**. The reviewer agent flags any
-   diff that adds a `test_coverage.md` entry as a Real finding to
-   be deleted in Step 4.
-3. **Coverage gate in `bin/test`**. Every `bin/flow ci` full-suite
-   run passes `--fail-under-lines 100 --fail-under-regions 100
-   --fail-under-functions 100` to `cargo llvm-cov nextest`. Any
-   uncovered region, function, or line fails CI and blocks the
-   commit. The thresholds are pinned at 100 and never lowered. The
-   flags live on the `cargo llvm-cov nextest` invocation inside
-   `bin/test`, so every CI run by every engineer on every branch
-   inherits the same gate.
-
-## How to Apply (When Authoring the Plan)
-
-When designing a plan that touches code:
-
-1. Identify every code path the changes will introduce.
-2. For each path, decide how it will be tested. Choose from the
-   three default responses above.
-3. Do not write "if X is hard to reach, add a waiver" anywhere in
-   the plan. If X is hard to reach, decide which of the three
-   responses fits and write THAT in the plan.
-4. After writing the plan, grep for waiver-suggestion phrases. If
-   any appear, rewrite them.
-5. If the plan has a "verify 100%" task, confirm the task body
-   hard-gates on per-file 100% (not measurement-only).
-
-## How to Apply (Code Phase)
-
-When implementing code that has a hard-to-reach branch:
-
-1. Try the three default responses in order. Subprocess test first
-   (cheapest), refactor second, design change third.
-2. If you find yourself wanting to file a waiver, stop. The waiver
-   instinct is a signal that you have not yet found the right test
-   surface — it is never the answer.
-3. Commit the test or refactor in the same task as the code that
-   would otherwise be uncovered.
-
-## How to Apply (Review Phase)
-
-When triaging findings:
-
-1. If a finding describes a coverage gap, the only valid fixes are
-   subprocess test, refactor, or design change. "Add a waiver" is
-   never a valid fix and the finding stays open until one of the
-   three responses lands.
-2. If the diff adds a `test_coverage.md` entry, route the entry
-   for deletion in Step 4 regardless of file location. Per
-   `.claude/rules/supersession.md`, the entry is dead code in the
-   PR's wake.
+Enforced by `bin/test`'s `--fail-under-lines/regions/functions 100` (pinned,
+never lowered) and the Review reviewer agent flagging any added waiver file.
