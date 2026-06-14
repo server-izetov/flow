@@ -69,7 +69,7 @@ const REVIEW_PHASES: &[&str] = &["flow-review"];
 /// a future session would rediscover from zero at full lifecycle cost.
 /// The override exists as a deliberate-friction escape hatch for
 /// exceptional cases the rule allows (e.g., a FLOW process gap raised
-/// inside a Review that genuinely cannot wait for Phase 4 Learn).
+/// inside a Review that genuinely cannot wait).
 ///
 /// - `state_json` is the raw contents of the current branch's state
 ///   file. `None` when no flow is active — the command is also used
@@ -93,7 +93,7 @@ pub(crate) fn should_reject_for_review(
     }
     // Defense in depth: serde_json's default last-wins behavior on
     // duplicate keys lets a crafted state file like
-    // `{"current_phase":"flow-review","current_phase":"flow-learn"}`
+    // `{"current_phase":"flow-review","current_phase":"flow-code"}`
     // bypass the gate when the parsed value is read normally. Scan
     // the raw content for ANY occurrence of `"current_phase"`
     // followed by a value that normalizes to one of
@@ -125,10 +125,9 @@ pub(crate) fn should_reject_for_review(
 
 fn review_block_message() -> String {
     "bin/flow issue is disabled during Review. All real \
-     findings must be fixed in Step 4. If this is a FLOW \
-     process gap, file it during Phase 4 Learn. If truly \
-     needed, pass --override-review-ban with an \
-     explicit reason."
+     findings must be fixed in Step 4. If a FLOW process \
+     gap truly cannot wait, pass --override-review-ban with \
+     an explicit reason."
         .to_string()
 }
 
